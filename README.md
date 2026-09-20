@@ -73,7 +73,7 @@ determify ./src
 
 ---
 
-### ⚡ Optional Superchargers: Semantic Triage with Jev & Kev
+### ⚡ Optional Superchargers: Semantic Triage with Jev or Kev
 
 While `determify` is completely functional on its own without any AI models, you can optionally supercharge it with fast decision models to semantically evaluate context and triage borderline code.
 
