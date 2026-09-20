@@ -75,7 +75,11 @@ determify ./src
 
 ### ⚡ Optional Superchargers: Semantic Triage with Jev & Kev
 
-While `determify` is completely functional on its own, you can optionally supercharge it with fast decision models to semantically evaluate context and triage borderline code:
+While `determify` is completely functional on its own without any AI models, you can optionally supercharge it with fast decision models to semantically evaluate context and triage borderline code.
+
+You have two choices for decision intelligence:
+1. **Cloud:** [TypeSafe Jev](https://docs.typesafe.ai) via the OpenRouter Decisions API.
+2. **Local / Self-Hosted:** **[Kev](https://github.com/jaredpalmer/kev)** — Jared Palmer's open-weights 0.6B non-autoregressive decision model. Kev is 100% API compatible with TypeSafe System One, can be self-hosted on your own GPU/CPU for zero API fees, and delivers sub-90ms local decision speeds.
 
 #### 2. Intelligent Triage with TypeSafe Jev (`--jev`)
 Pass suspicious call sites directly to TypeSafe Jev via the OpenRouter Decisions API. In <100ms, Jev evaluates the surrounding code and classifies whether it's truly deterministic, a decision candidate, or legitimately generative:
@@ -85,17 +89,22 @@ determify ./src --jev
 ```
 
 #### 3. On-Premises Air-Gapped Triage with Kev-0.6B (`--kev`)
-Run decisions entirely offline on your local GPU using Jared Palmer's open-weights [Kev-0.6B](https://github.com/jaredpalmer/kev). 100% API parity with Jev running locally on LAN in ~70ms ($0.00 cost):
+If you want complete privacy, zero API costs, or offline air-gapped execution, deploy **[jaredpalmer/kev](https://github.com/jaredpalmer/kev)** locally. `determify` communicates directly with Kev's `/v1/systemone` endpoint:
 ```bash
+# Point to your local or LAN Kev server (default: http://localhost:8009/v1/systemone)
 export KEV_ENDPOINT="http://localhost:8009/v1/systemone"
 determify ./src --kev
 ```
 
+> **How to run Kev:** Check out the official repository at **[github.com/jaredpalmer/kev](https://github.com/jaredpalmer/kev)** to run the lightweight server locally with PyTorch or vLLM. It consumes ~2.5GB of VRAM and runs in `bf16` on any consumer GPU.
+
 #### 4. Deep Semantic Codebase Sweep (`--deep`)
-For complex projects where simple regexes cannot catch prompt misuse, `--deep` chunks functions and scripts, prompting the decision engine to semantically inspect code blocks:
+For complex projects where simple regexes cannot catch prompt misuse, `--deep` chunks functions and scripts, prompting the decision engine (Jev or Kev) to semantically inspect code blocks:
 ```bash
+# Cloud Jev deep scan:
 determify ./src --jev --deep
-# or on local GPU:
+
+# Or completely local & free via Kev:
 determify ./src --kev --deep
 ```
 
