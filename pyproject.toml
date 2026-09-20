@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
-    { name = "Roderick", email = "20000450+rodericklm1@users.noreply.github.com" },
+    { name = "rodericklm1", email = "20000450+rodericklm1@users.noreply.github.com" },
 ]
 keywords = [
     "llm",

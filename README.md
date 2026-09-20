@@ -6,7 +6,7 @@
 
 > 💡 **Zero Dependencies & Fully Standalone:**  
 > **You do NOT need an API key, an LLM, or TypeSafe Jev to use `determify`.**  
-> Out of the box, `determify` runs completely offline as a fast static AST and lexical analysis tool with **zero external dependencies**. Connecting it to Jev or local Kev is an **optional supercharger** that adds semantic triage on top of the scanner.
+> Out of the box, `determify` runs completely offline as a fast static lexical analysis tool with **zero external dependencies**. Connecting it to Jev or local Kev is an **optional supercharger** that adds semantic triage on top of the scanner.
 
 Inspired by **[jevify](https://github.com/altryne/jevify)**, `determify` audits your code, agent tool definitions, and automation scripts to find where developers are using generative LLMs (Claude, GPT-4, Gemini) to do tasks that standard code—or a sub-100ms decision model—can solve in 2ms for $0.00.
 
@@ -17,6 +17,7 @@ Inspired by **[jevify](https://github.com/altryne/jevify)**, `determify` audits 
 When building agentic workflows or automated software, every task falls into one of three tiers:
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '13px' }}}%%
 flowchart TD
     Task([Incoming Task / Operation]) --> T0{Can it be solved with math, regex, or system calls?}
     T0 -- Yes --> Tier0[Tier 0: Pure Determinism\nPOSIX Bash / Python stdlib\n$0.00 • 0ms latency • 0% hallucination]
@@ -99,7 +100,7 @@ determify ./src --kev
 > **How to run Kev:** Check out the official repository at **[github.com/jaredpalmer/kev](https://github.com/jaredpalmer/kev)** to run the lightweight server locally with PyTorch or vLLM. It consumes ~2.5GB of VRAM and runs in `bf16` on any consumer GPU.
 
 #### 4. Deep Semantic Codebase Sweep (`--deep`)
-For complex projects where simple regexes cannot catch prompt misuse, `--deep` chunks functions and scripts, prompting the decision engine (Jev or Kev) to semantically inspect code blocks:
+For complex projects where simple regexes cannot catch prompt misuse, `--deep` chunks functions and scripts, prompting the decision engine (Jev or Kev) to semantically inspect code blocks. Requires an explicit provider flag (`--jev` or `--kev`) to ensure source code is never sent to a cloud endpoint unintentionally:
 ```bash
 # Cloud Jev deep scan:
 determify ./src --jev --deep
@@ -109,38 +110,35 @@ determify ./src --kev --deep
 ```
 
 #### 5. CI/CD & Automation (JSON Output)
-Output structured JSON findings for automated linters, CI pipelines, or pre-commit hooks:
+Output structured JSON findings for automated linters, CI pipelines, or pre-commit hooks. Use `--fail-on-findings` to exit with code 1 if actionable anti-patterns are found:
 ```bash
-determify ./src --json
+determify ./src --json --fail-on-findings
 ```
 
 ---
 
-## 📊 Real-World Fleet Benchmark Results
+## 📊 Benchmark & Architecture Overview
 
-In production testing across sovereign homelab clusters and autonomous background daemons (feed miners, log auditors, SRE routers, drop-queue processors):
-
-### 1. The Multi-Tier Flow & Cost Reduction
-Before Determify & Jev/Kev, every background task burned 2,000–30,000 tokens on frontier LLMs. With Determify, tasks are triaged into the cheapest, fastest possible layer:
+Before Determify & Jev/Kev, background tasks and agent pipelines frequently burn 2,000–30,000 tokens on frontier LLMs for trivial checks. With Determify, tasks are triaged into the cheapest, fastest possible layer:
 
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '13px' }}}%%
 flowchart LR
-    subgraph INGRESS["Autonomous Daemon Workloads (15,200 Ops/Mo)"]
+    subgraph INGRESS["Application & Agent Workloads"]
         direction TB
-        W1["Feed & YouTube Miners"]
-        W2["Incident & Failure Log Miners"]
-        W3["Skill Radar & Task Routers"]
-        W4["Cross-Harness Queue Drains"]
+        W1["Data Extractors & Web Scrapers"]
+        W2["Triage & Routing Workers"]
+        W3["Background Maintenance Daemons"]
+        W4["Incoming User Requests"]
     end
 
     INGRESS --> SCAN{"determify\nAudit & Triage"}
 
-    subgraph TIERS["Sovereign Execution Tiers"]
+    subgraph TIERS["Execution Tiers"]
         direction TB
-        T0["🟢 Tier 0: Pure Code\n65% of Workload (POSIX/Stdlib)\nLatency: <2ms • Cost: $0.00"]
-        T05["⚡ Tier 0.5: Decision Models\n30% of Workload (Jev / Kev-0.6B)\nLatency: ~72ms • Cost: $0.23/mo"]
-        T2["🟣 Tier 2-5: Generative LLMs\n5% of Workload (Claude/GPT-4o)\nLatency: 3-8s • Only when creative synthesis needed"]
+        T0["🟢 Tier 0: Pure Code\nPOSIX / Python stdlib\nLatency: <2ms • Cost: $0.00"]
+        T05["⚡ Tier 0.5: Decision Models\nTypeSafe Jev / Kev-0.6B\nLatency: ~72ms • Cost: Fractions of a cent"]
+        T2["🟣 Tier 2-5: Generative LLMs\nClaude 3.5 Sonnet / GPT-4o\nLatency: 3-8s • Only when synthesis needed"]
     end
 
     SCAN -- "Deterministic" --> T0
@@ -160,19 +158,14 @@ flowchart LR
     class SCAN scanner;
 ```
 
----
+### Empirical Latency & Cost Comparison
 
-### 2. Empirical Performance & Cost Arbitrage
-Moving simple routing, scoring, and data extraction away from heavy autoregressive models delivered dramatic cost and latency reductions:
-
-| Metric | Before Determify (Pure LLMs) | After Determify (Tiered Architecture) | Impact |
+| Metric | Pure Frontier LLMs | Tiered Architecture (Determify + Jev/Kev) | Impact |
 | :--- | :--- | :--- | :--- |
-| **Monthly Prompt Tokens** | 24,800,000 | 1,300,000 | **-23.5 Million tokens (-94.7%)** |
-| **Median Execution Latency (p50)** | 5,400 ms (Claude/GPT-4) | **<75 ms** (Kev-0.6B / Jev) | **72x faster execution** |
+| **Decision Latency (p50)** | 5,400 ms (Claude/GPT-4) | **<75 ms** (Kev-0.6B / Jev) | **72x faster execution** |
 | **Deterministic Data Latency** | 2,800 ms (Gemini Flash) | **<2 ms** (POSIX / Python stdlib) | **1,400x faster execution** |
-| **Monthly Operating Cost** | $82.44 | **$0.23** | **$82.21/mo net savings (358:1 ROI)** |
+| **Prompt Token Consumption** | High (full prompt history) | **Minimal** (eliminated or compressed) | **Up to 90%+ token reduction** |
 | **Hallucination Risk on Data Ops** | Non-zero | **0.00%** | **Eliminated on Tier 0 & Tier 0.5** |
-| **Daemons & Pipelines Converted** | 0 | **7 Background Daemons** | **100% automated test coverage** |
 
 ---
 
@@ -186,4 +179,4 @@ Works out of the box with any AI framework or language:
 ---
 
 ## 📜 License
-MIT License. Copyright (c) 2026 Roderick.
+MIT License. Copyright (c) 2026 rodericklm1.

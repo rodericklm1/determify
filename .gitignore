@@ -24,6 +24,8 @@ MANIFEST
 
 # Virtual environments
 .env
+.env.*
+.env.local
 .venv
 env/
 venv/
@@ -34,7 +36,10 @@ venv.bak/
 # Testing & Linting
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.tox/
 .coverage
+.coverage.*
 htmlcov/
 
 # IDE & OS
@@ -44,6 +49,7 @@ htmlcov/
 *.swo
 .DS_Store
 
-# Determify local logs
-.determify/
+# Logs
+*.log
 decisions.jsonl
+.determify/

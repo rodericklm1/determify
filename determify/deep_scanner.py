@@ -3,11 +3,13 @@ deep_scanner.py - Semantic Chunk Analysis for Determify.
 Scans functions and script blocks using Jev or Kev to find unflagged, implicit LLM misuse.
 """
 
+import time
 from .jev_evaluator import call_decision_endpoint
 
-def deep_scan_file(file_path, file_content, use_kev=False):
+def deep_scan_file(file_path, file_content, use_kev=False, env_file=None):
     """
     Chunked semantic scan across files containing LLM signals.
+    Requires an explicit decision provider (Jev or Kev).
     """
     findings = []
     lines = file_content.splitlines()
@@ -58,31 +60,31 @@ def deep_scan_file(file_path, file_content, use_kev=False):
             }
         }
 
-        try:
-            data, provider_name = call_decision_endpoint(payload, use_kev=use_kev)
-            ans = data.get("answers", {})
-            unnecessary_prob = ans.get("contains_unnecessary_ai", {}).get("noul", 0.0)
-            rep_tier = ans.get("replacement_tier", {}).get("choice", "legitimate_generative")
+        t0 = time.time()
+        data, provider_name = call_decision_endpoint(payload, use_kev=use_kev, env_file=env_file)
+        lat_ms = round((time.time() - t0) * 1000, 1)
 
-            if unnecessary_prob >= 0.70 and rep_tier != "legitimate_generative":
-                findings.append({
-                    "id": "DET-DEEP",
-                    "file": file_path,
-                    "line": start_line,
-                    "snippet": chunk_lines[0].strip()[:100],
-                    "name": "Semantic LLM Overuse Detected (Deep Scan)",
-                    "description": f"Semantic analysis flagged unnecessary generative AI logic (probability {unnecessary_prob:.2f}).",
-                    "fix": f"Refactor to {rep_tier.replace('_', ' ').title()}.",
-                    "savings": "Eliminates high-latency generative roundtrips",
-                    "jev_eval": {
-                        "optimal_tier": rep_tier,
-                        "provider": provider_name,
-                        "confidence": unnecessary_prob,
-                        "deterministic_prob": unnecessary_prob,
-                        "latency_ms": 120.0
-                    }
-                })
-        except Exception:
-            pass
+        ans = data.get("answers", {})
+        unnecessary_prob = ans.get("contains_unnecessary_ai", {}).get("noul", 0.0)
+        rep_tier = ans.get("replacement_tier", {}).get("choice", "legitimate_generative")
+
+        if unnecessary_prob >= 0.70 and rep_tier != "legitimate_generative":
+            findings.append({
+                "id": "DET-DEEP",
+                "file": file_path,
+                "line": start_line,
+                "snippet": chunk_lines[0].strip()[:100],
+                "name": "Semantic LLM Overuse Detected (Deep Scan)",
+                "description": f"Semantic analysis flagged unnecessary generative AI logic (probability {unnecessary_prob:.2f}).",
+                "fix": f"Refactor to {rep_tier.replace('_', ' ').title()}.",
+                "savings": "Eliminates high-latency generative roundtrips",
+                "jev_eval": {
+                    "optimal_tier": rep_tier,
+                    "provider": provider_name,
+                    "confidence": unnecessary_prob,
+                    "deterministic_prob": unnecessary_prob,
+                    "latency_ms": lat_ms
+                }
+            })
 
     return findings

@@ -1,6 +1,6 @@
 """
 jev_evaluator.py - Decision Evaluation Bridge for Determify.
-Connects to TypeSafe Jev (Cloud OpenRouter Decisions API) or On-Prem Kev-0.6B.
+Connects explicitly to TypeSafe Jev (Cloud OpenRouter Decisions API) or On-Prem Kev-0.6B.
 """
 
 import os
@@ -14,37 +14,34 @@ from pathlib import Path
 OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions")
 DEFAULT_KEV_URL = "http://localhost:8009/v1/systemone"
 
-def get_api_key():
-    """Resolves OPENROUTER_API_KEY from environment or standard .env files."""
+def get_api_key(env_file=None):
+    """
+    Resolves OPENROUTER_API_KEY from environment or explicit local .env file.
+    Does NOT traverse parent directories or $HOME to prevent accidental key/data leakage.
+    """
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
-        return key
+        return key.strip("\"'")
 
-    # Check current directory and parents for .env
-    cur = Path.cwd()
-    candidates = [
-        cur / ".env",
-        cur.parent / ".env",
-        Path.home() / ".env"
-    ]
-    for env_path in candidates:
-        if env_path.exists():
-            try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("OPENROUTER_API_KEY=") and not line.strip().startswith("#"):
-                            return line.strip().split("=", 1)[1].strip("\"'")
-            except Exception:
-                pass
+    target_env = Path(env_file) if env_file else Path.cwd() / ".env"
+    if target_env.exists() and target_env.is_file():
+        try:
+            with open(target_env, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("OPENROUTER_API_KEY=") and not line.strip().startswith("#"):
+                        return line.strip().split("=", 1)[1].strip("\"'")
+        except Exception:
+            pass
     return None
 
 def get_kev_url():
     """Resolves local Kev-0.6B endpoint URL."""
     return os.environ.get("KEV_ENDPOINT", DEFAULT_KEV_URL)
 
-def call_decision_endpoint(payload, use_kev=False):
+def call_decision_endpoint(payload, use_kev=False, env_file=None):
     """
     Executes a decision request against on-prem Kev-0.6B or Cloud Jev.
+    Fails explicitly with helpful error messages instead of silently catching errors.
     """
     if use_kev:
         kev_url = get_kev_url()
@@ -54,13 +51,23 @@ def call_decision_endpoint(payload, use_kev=False):
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8")), "kev-0.6b (local)"
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8")), "kev-0.6b (local)"
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"Failed to connect to local Kev endpoint at {kev_url}: {e.reason}.\n"
+                f"Ensure Kev is running (e.g. 'python server.py') or specify KEV_ENDPOINT."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Error executing decision on Kev ({kev_url}): {e}") from e
 
-    api_key = get_api_key()
+    api_key = get_api_key(env_file=env_file)
     if not api_key:
-        # Fallback to local Kev if no API key is set
-        return call_decision_endpoint(payload, use_kev=True)
+        raise ValueError(
+            "OPENROUTER_API_KEY not found in environment or local .env.\n"
+            "To use cloud Jev triage, set OPENROUTER_API_KEY, or use --kev for on-prem triage."
+        )
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -74,10 +81,16 @@ def call_decision_endpoint(payload, use_kev=False):
         headers=headers,
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        return json.loads(resp.read().decode("utf-8")), "jev-latest (cloud)"
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8")), "jev-latest (cloud)"
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenRouter Decisions API error ({e.code}): {err_msg}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error connecting to OpenRouter ({OPENROUTER_DECISIONS_URL}): {e.reason}") from e
 
-def evaluate_with_jev(finding, file_content, use_kev=False):
+def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None):
     """
     Evaluates an identified code finding using Jev or Kev to determine optimal tier.
     """
@@ -123,24 +136,21 @@ def evaluate_with_jev(finding, file_content, use_kev=False):
         }
     }
 
-    try:
-        t0 = time.time()
-        data, provider_name = call_decision_endpoint(payload, use_kev=use_kev)
-        lat_ms = round((time.time() - t0) * 1000, 1)
+    t0 = time.time()
+    data, provider_name = call_decision_endpoint(payload, use_kev=use_kev, env_file=env_file)
+    lat_ms = round((time.time() - t0) * 1000, 1)
 
-        ans = data.get("answers", {})
-        tier = ans.get("optimal_tier", {}).get("choice", "tier_frontier_generative")
-        confidence = ans.get("optimal_tier", {}).get("confidence", 0.0)
-        det_prob = ans.get("can_be_deterministic", {}).get("noul", 0.0)
-        action_score = ans.get("actionability_score", {}).get("score", 0.0)
+    ans = data.get("answers", {})
+    tier = ans.get("optimal_tier", {}).get("choice", "tier_frontier_generative")
+    confidence = ans.get("optimal_tier", {}).get("confidence", 0.0)
+    det_prob = ans.get("can_be_deterministic", {}).get("noul", 0.0)
+    action_score = ans.get("actionability_score", {}).get("score", 0.0)
 
-        return {
-            "optimal_tier": tier,
-            "provider": provider_name,
-            "confidence": round(confidence, 2),
-            "deterministic_prob": round(det_prob, 2),
-            "actionability_score": action_score,
-            "latency_ms": lat_ms
-        }
-    except Exception:
-        return None
+    return {
+        "optimal_tier": tier,
+        "provider": provider_name,
+        "confidence": round(confidence, 2),
+        "deterministic_prob": round(det_prob, 2),
+        "actionability_score": action_score,
+        "latency_ms": lat_ms
+    }
