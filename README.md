@@ -165,32 +165,14 @@ flowchart LR
 ### 2. Empirical Performance & Cost Arbitrage
 Moving simple routing, scoring, and data extraction away from heavy autoregressive models delivered dramatic cost and latency reductions:
 
-```mermaid
-%%{init: {'theme': 'dark'}}%%
-gantt
-    title Real-World Execution Latency Comparison (p50)
-    dateFormat X
-    axisFormat %s ms
-
-    section Frontier LLMs (Before)
-    Claude 3.5 Sonnet / GPT-4o : 0, 5400
-    Gemini 1.5 Flash          : 0, 2800
-
-    section Decision Models (After)
-    TypeSafe Jev (Cloud)      : 0, 240
-    Kev-0.6B (Local GPU 1)    : 0, 72
-
-    section Deterministic (After)
-    Python stdlib / POSIX     : 0, 2
-```
-
 | Metric | Before Determify (Pure LLMs) | After Determify (Tiered Architecture) | Impact |
 | :--- | :--- | :--- | :--- |
 | **Monthly Prompt Tokens** | 24,800,000 | 1,300,000 | **-23.5 Million tokens (-94.7%)** |
-| **Median Execution Latency** | 5,400 ms | <75 ms | **72x faster execution** |
-| **Monthly Operating Cost** | $82.44 | $0.23 | **$82.21/mo net savings (358:1 ROI)** |
-| **Hallucination Risk on Data Ops** | Non-zero | 0.00% | **Eliminated on Tier 0 & Tier 0.5** |
-| **Pipelines Converted** | 0 | 7 Background Daemons | **100% automated test coverage** |
+| **Median Execution Latency (p50)** | 5,400 ms (Claude/GPT-4) | **<75 ms** (Kev-0.6B / Jev) | **72x faster execution** |
+| **Deterministic Data Latency** | 2,800 ms (Gemini Flash) | **<2 ms** (POSIX / Python stdlib) | **1,400x faster execution** |
+| **Monthly Operating Cost** | $82.44 | **$0.23** | **$82.21/mo net savings (358:1 ROI)** |
+| **Hallucination Risk on Data Ops** | Non-zero | **0.00%** | **Eliminated on Tier 0 & Tier 0.5** |
+| **Daemons & Pipelines Converted** | 0 | **7 Background Daemons** | **100% automated test coverage** |
 
 ---
 
