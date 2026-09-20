@@ -2,7 +2,11 @@
 
 > **"Never use an LLM if a 3-line Bash script solves it for zero tokens, zero latency, and zero hallucinations."**
 
-`determify` is a code scanner and static analysis tool designed to eliminate token bloat, latency spikes, and unnecessary AI API costs in modern agentic pipelines.
+`determify` is a standalone code scanner and static analysis tool designed to eliminate token bloat, latency spikes, and unnecessary AI API costs in modern agentic pipelines.
+
+> 💡 **Zero Dependencies & Fully Standalone:**  
+> **You do NOT need an API key, an LLM, or TypeSafe Jev to use `determify`.**  
+> Out of the box, `determify` runs completely offline as a fast static AST and lexical analysis tool with **zero external dependencies**. Connecting it to Jev or local Kev is an **optional supercharger** that adds semantic triage on top of the scanner.
 
 Inspired by **[jevify](https://github.com/altryne/jevify)**, `determify` audits your code, agent tool definitions, and automation scripts to find where developers are using generative LLMs (Claude, GPT-4, Gemini) to do tasks that standard code—or a sub-100ms decision model—can solve in 2ms for $0.00.
 
@@ -57,27 +61,37 @@ pip install -e .
 
 ## 💻 Usage
 
-### 1. Basic Static Lexical Scan
-Scan your codebase or directory for obvious deterministic anti-patterns:
+### 1. Standalone Static Scan (No API Keys / No Setup Required)
+Scan your codebase or directory for deterministic anti-patterns. Runs 100% offline, instantly, with zero configuration:
 ```bash
+# Scan current directory
+determify
+
+# Scan specific path
 determify ./src
 ```
 
-### 2. Intelligent Triage with TypeSafe Jev (`--jev`)
+---
+
+### ⚡ Optional Superchargers: Semantic Triage with Jev & Kev
+
+While `determify` is completely functional on its own, you can optionally supercharge it with fast decision models to semantically evaluate context and triage borderline code:
+
+#### 2. Intelligent Triage with TypeSafe Jev (`--jev`)
 Pass suspicious call sites directly to TypeSafe Jev via the OpenRouter Decisions API. In <100ms, Jev evaluates the surrounding code and classifies whether it's truly deterministic, a decision candidate, or legitimately generative:
 ```bash
 export OPENROUTER_API_KEY="your-key"
 determify ./src --jev
 ```
 
-### 3. On-Premises Air-Gapped Triage with Kev-0.6B (`--kev`)
-Run decisions entirely offline on your local GPU using Jared Palmer's open-weights [Kev-0.6B](https://github.com/jaredpalmer/kev). 100% API parity with Jev running locally on LAN in ~70ms:
+#### 3. On-Premises Air-Gapped Triage with Kev-0.6B (`--kev`)
+Run decisions entirely offline on your local GPU using Jared Palmer's open-weights [Kev-0.6B](https://github.com/jaredpalmer/kev). 100% API parity with Jev running locally on LAN in ~70ms ($0.00 cost):
 ```bash
 export KEV_ENDPOINT="http://localhost:8009/v1/systemone"
 determify ./src --kev
 ```
 
-### 4. Deep Semantic Codebase Sweep (`--deep`)
+#### 4. Deep Semantic Codebase Sweep (`--deep`)
 For complex projects where simple regexes cannot catch prompt misuse, `--deep` chunks functions and scripts, prompting the decision engine to semantically inspect code blocks:
 ```bash
 determify ./src --jev --deep
@@ -85,8 +99,8 @@ determify ./src --jev --deep
 determify ./src --kev --deep
 ```
 
-### 5. CI/CD & Automation (JSON Output)
-Output structured JSON findings for automated linters or pre-commit hooks:
+#### 5. CI/CD & Automation (JSON Output)
+Output structured JSON findings for automated linters, CI pipelines, or pre-commit hooks:
 ```bash
 determify ./src --json
 ```
