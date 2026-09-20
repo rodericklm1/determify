@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "determify"
+version = "0.1.0"
+description = "Deterministic Execution & Token-Avoidance Scanner. Find where code uses AI when a 3-line script or decision model is better."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "Roderick", email = "20000450+rodericklm1@users.noreply.github.com" },
+]
+keywords = [
+    "llm",
+    "token-optimization",
+    "typesafe",
+    "jev",
+    "kev",
+    "agentic-engineering",
+    "cost-reduction",
+    "sre",
+    "finops"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+determify = "determify.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rodericklm1/determify"
+Repository = "https://github.com/rodericklm1/determify"
+Issues = "https://github.com/rodericklm1/determify/issues"
