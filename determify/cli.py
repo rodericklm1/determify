@@ -11,11 +11,18 @@ from .jev_evaluator import get_kev_url, OPENROUTER_DECISIONS_URL, get_api_key
 from . import __version__
 
 def main():
+    try:
+        _run_cli()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nScan cancelled by user.\n")
+        sys.exit(130)
+
+def _run_cli():
     parser = argparse.ArgumentParser(
         prog="determify",
         description="determify: Find where code uses AI when a deterministic script or decision model is better."
     )
-    parser.add_argument("path", nargs="*", default=["."], help="Files or directories to scan (default: current directory)")
+    parser.add_argument("path", nargs="*", default=["."], help="Files or directories to scan (default: current directory). Use '--' before paths starting with a dash.")
     parser.add_argument("--jev", action="store_true", help="Use TypeSafe Jev via Cloud OpenRouter Decisions API for intelligent semantic triage")
     parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for sub-90ms local triage")
     parser.add_argument("--deep", action="store_true", help="Execute deep semantic chunk analysis to detect unflagged AI waste (requires --jev or --kev)")
@@ -69,7 +76,6 @@ def main():
             f_path = Path(f["file"]).resolve()
             f["file"] = str(f_path.relative_to(cwd))
         except ValueError:
-            # If outside cwd, keep clean path
             pass
 
     if args.json:

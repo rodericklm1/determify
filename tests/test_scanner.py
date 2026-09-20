@@ -1,14 +1,16 @@
 """
-test_scanner.py - Comprehensive Unit Tests for Determify.
+test_scanner.py - Comprehensive Unit Tests & Adversarial Stress Tests for Determify.
 """
 
 import os
 import sys
+import time
 import unittest
 import tempfile
 import subprocess
 from pathlib import Path
-from determify.scanner import scan_file, scan_targets
+from determify.scanner import scan_file, scan_targets, read_source_file_safe
+from determify.jev_evaluator import _post_json
 
 class TestDetermifyScanner(unittest.TestCase):
 
@@ -118,6 +120,42 @@ class TestDetermifyScanner(unittest.TestCase):
             env["PYTHONPATH"] = str(Path(__file__).parent.parent)
             res = subprocess.run(cmd, env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 1)
+
+    # --- Red-Team Adversarial Tests ---
+
+    def test_redos_prefix_bomb_budget(self):
+        """Tests that a pathological prefix-bomb executes in <500ms and avoids ReDoS."""
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write("format date " * 15000)
+            f.flush()
+            t0 = time.perf_counter()
+            scan_file(f.name)
+            elapsed = time.perf_counter() - t0
+        
+        os.unlink(f.name)
+        self.assertLess(elapsed, 0.5, f"ReDoS vulnerability detected: took {elapsed:.2f}s")
+
+    def test_fifo_does_not_hang(self):
+        """Tests that FIFOs / pipes are safely rejected without blocking."""
+        with tempfile.TemporaryDirectory() as td:
+            fifo_path = os.path.join(td, "pipe.py")
+            try:
+                os.mkfifo(fifo_path)
+            except (AttributeError, OSError):
+                return  # Skip if platform lacks mkfifo
+            
+            t0 = time.perf_counter()
+            content = read_source_file_safe(fifo_path)
+            elapsed = time.perf_counter() - t0
+            
+            self.assertEqual(content, "")
+            self.assertLess(elapsed, 0.1, "FIFO read blocked the process")
+
+    def test_file_scheme_ssrf_rejected(self):
+        """Tests that file:// endpoints are refused to prevent LFI/SSRF."""
+        with self.assertRaises(RuntimeError) as ctx:
+            _post_json("file:///etc/passwd", {}, headers={}, timeout=1)
+        self.assertIn("Refusing non-HTTP(S) endpoint", str(ctx.exception))
 
 if __name__ == "__main__":
     unittest.main()

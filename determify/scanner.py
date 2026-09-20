@@ -1,9 +1,12 @@
 """
 scanner.py - Core File & Directory Scanner for Determify.
+Secure file reading, symlink safety, size bounds, and zero-allocation regex evaluation.
 """
 
 import os
 import sys
+import stat
+import errno
 from pathlib import Path
 from .patterns import PATTERNS
 from .jev_evaluator import evaluate_with_jev
@@ -11,30 +14,65 @@ from .deep_scanner import deep_scan_file
 
 IGNORED_DIRS = {
     ".git", "node_modules", ".venv", "venv", "__pycache__",
-    ".pytest_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode", "tests"
+    ".pytest_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode", "tests", "test"
 }
 
-# Code-focused file extensions scanned by default (markdown files excluded by default to avoid documentation false positives)
 SUPPORTED_EXTENSIONS = {
     ".py", ".ts", ".js", ".jsx", ".tsx", ".sh", ".bash"
 }
 
-def scan_file(file_path):
+MAX_FILE_BYTES = 1_000_000  # 1 MiB cap prevents memory exhaustion on minified bundles
+
+def read_source_file_safe(file_path: str) -> str:
+    """
+    Safely opens and reads a regular file without following symlinks.
+    Blocks FIFOs, character devices (/dev/zero), and oversized files.
+    Uses O_NONBLOCK so opening a FIFO fails immediately rather than blocking.
+    """
+    fd = None
+    try:
+        # O_NONBLOCK prevents hanging if path is a FIFO
+        fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, IOError):
+        return ""
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return ""
+        if st.st_size > MAX_FILE_BYTES:
+            return ""
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            fd = None  # fdopen transfers ownership
+            return f.read(MAX_FILE_BYTES)
+    except Exception:
+        return ""
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+def scan_file(file_path: str, content: str = None):
     """
     Lexical and pattern scan on a single source file.
     Deduplicates multiple matching alternations on the same line.
     """
     findings = []
     seen_keys = set()
-    fname = os.path.basename(file_path)
-    if fname in ("scanner.py", "patterns.py", "determify.py"):
-        return findings
 
+    # Self-file skip based on real canonical path
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-    except (IOError, OSError) as e:
-        sys.stderr.write(f"Warning: Unable to read file {file_path}: {e}\n")
+        if os.path.samefile(file_path, __file__):
+            return findings
+    except (OSError, ValueError):
+        pass
+
+    if content is None:
+        content = read_source_file_safe(file_path)
+
+    if not content:
         return findings
 
     lines = content.splitlines()
@@ -61,39 +99,36 @@ def scan_file(file_path):
                         "savings": det07["savings"]
                     })
 
-    # Pattern matches for DET-01 through DET-06
-    for p in PATTERNS:
-        if p["id"] == "DET-07":
+    # Line-by-line inspection for DET-01 through DET-06 (eliminates multi-line O(n²) string copies)
+    for line_idx, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith(("#", "//", "/*", "*")):
             continue
-        matches = p["regex"].finditer(content)
-        for m in matches:
-            line_no = content[:m.start()].count("\n") + 1
-            # Skip pure comments
-            if 0 <= line_no - 1 < len(lines):
-                line_str = lines[line_no - 1].strip()
-                if line_str.startswith(("#", "//", "/*", "*")):
-                    continue
 
-            key = (file_path, line_no, p["id"])
-            if key not in seen_keys:
-                seen_keys.add(key)
-                findings.append({
-                    "id": p["id"],
-                    "file": file_path,
-                    "line": line_no,
-                    "snippet": m.group(0)[:120].replace("\n", " "),
-                    "name": p["name"],
-                    "description": p["description"],
-                    "fix": p["fix"],
-                    "savings": p["savings"]
-                })
+        for p in PATTERNS:
+            if p["id"] == "DET-07":
+                continue
+            if p["regex"].search(line):
+                key = (file_path, line_idx, p["id"])
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    findings.append({
+                        "id": p["id"],
+                        "file": file_path,
+                        "line": line_idx,
+                        "snippet": stripped[:120],
+                        "name": p["name"],
+                        "description": p["description"],
+                        "fix": p["fix"],
+                        "savings": p["savings"]
+                    })
 
     return findings
 
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None):
     """
-    Scans a list of target paths (files or directories).
-    Returns (scanned_count, all_findings, unreadable_count).
+    Scans target paths (files or directories).
+    Returns (scanned_count, all_findings).
     """
     all_findings = []
     scanned_files = 0
@@ -106,60 +141,69 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
             sys.stderr.write(f"Warning: Target path does not exist: {t}\n")
             continue
         if p.is_file():
-            target_files.append(str(p.resolve()))
+            target_files.append(str(p))
         elif p.is_dir():
-            target_dirs.append(str(p.resolve()))
+            target_dirs.append(str(p))
 
     for fpath in target_files:
-        try:
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            scanned_files += 1
-            findings = scan_file(fpath)
+        content = read_source_file_safe(fpath)
+        if not content:
+            continue
 
-            if (use_jev or use_kev) and findings:
-                for item in findings:
+        scanned_files += 1
+        findings = scan_file(fpath, content=content)
+
+        if (use_jev or use_kev) and findings:
+            for item in findings:
+                try:
                     verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
                     if verdict:
                         item["jev_eval"] = verdict
+                except Exception as e:
+                    sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
 
-            if deep_scan:
+        if deep_scan:
+            try:
                 deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
                 if deep_findings:
                     findings.extend(deep_findings)
+            except Exception as e:
+                sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
 
-            all_findings.extend(findings)
-        except (IOError, OSError) as e:
-            sys.stderr.write(f"Warning: Could not open file {fpath}: {e}\n")
+        all_findings.extend(findings)
 
     for d in target_dirs:
-        for root, dirs, files in os.walk(d):
-            # Prune ignored directories in place
+        for root, dirs, files in os.walk(d, followlinks=False):
             dirs[:] = [sub for sub in dirs if sub not in IGNORED_DIRS]
 
             for fname in files:
                 ext = Path(fname).suffix.lower()
                 if ext in SUPPORTED_EXTENSIONS:
                     fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        scanned_files += 1
-                        findings = scan_file(fpath)
+                    content = read_source_file_safe(fpath)
+                    if not content:
+                        continue
 
-                        if (use_jev or use_kev) and findings:
-                            for item in findings:
+                    scanned_files += 1
+                    findings = scan_file(fpath, content=content)
+
+                    if (use_jev or use_kev) and findings:
+                        for item in findings:
+                            try:
                                 verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
                                 if verdict:
                                     item["jev_eval"] = verdict
+                            except Exception as e:
+                                sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
 
-                        if deep_scan:
+                    if deep_scan:
+                        try:
                             deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
                             if deep_findings:
                                 findings.extend(deep_findings)
+                        except Exception as e:
+                            sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
 
-                        all_findings.extend(findings)
-                    except (IOError, OSError) as e:
-                        sys.stderr.write(f"Warning: Could not open file {fpath}: {e}\n")
+                    all_findings.extend(findings)
 
     return scanned_files, all_findings
