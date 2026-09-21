@@ -23,6 +23,12 @@ SUPPORTED_EXTENSIONS = {
 
 MAX_FILE_BYTES = 1_000_000  # 1 MiB cap prevents memory exhaustion on minified bundles
 
+# Batch budget: bound how much work one scan pass does before reporting progress.
+# Bytes, not file count, because bytes are what bound wall-clock time.
+# Default on, so a large tree is observable without the caller knowing the flag exists.
+DEFAULT_BATCH_BYTES = 50_000_000  # 50 MiB per batch
+MIN_BATCH_BYTES = 1_000_000        # never let a caller set a batch below one file cap
+
 def read_source_file_safe(file_path: str) -> str:
     """
     Safely opens and reads a regular file without following symlinks.
@@ -125,85 +131,121 @@ def scan_file(file_path: str, content: str = None):
 
     return findings
 
-def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None):
-    """
-    Scans target paths (files or directories).
-    Returns (scanned_count, all_findings).
-    """
-    all_findings = []
-    scanned_files = 0
-    target_files = []
-    target_dirs = []
+def _iter_target_files(targets):
+    """Yields (fpath, size_bytes) for every supported file under the given targets.
 
+    Enumerating separately from scanning is what lets us batch by byte budget and
+    report progress before the work starts, instead of discovering the tree size
+    only as we consume it.
+    """
     for t in targets:
         p = Path(t)
         if not p.exists():
             sys.stderr.write(f"Warning: Target path does not exist: {t}\n")
             continue
         if p.is_file():
-            target_files.append(str(p))
-        elif p.is_dir():
-            target_dirs.append(str(p))
-
-    for fpath in target_files:
-        content = read_source_file_safe(fpath)
-        if not content:
-            continue
-
-        scanned_files += 1
-        findings = scan_file(fpath, content=content)
-
-        if (use_jev or use_kev) and findings:
-            for item in findings:
-                try:
-                    verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
-                    if verdict:
-                        item["jev_eval"] = verdict
-                except Exception as e:
-                    sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
-
-        if deep_scan:
             try:
-                deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
-                if deep_findings:
-                    findings.extend(deep_findings)
-            except Exception as e:
-                sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
-
-        all_findings.extend(findings)
-
-    for d in target_dirs:
-        for root, dirs, files in os.walk(d, followlinks=False):
-            dirs[:] = [sub for sub in dirs if sub not in IGNORED_DIRS]
-
-            for fname in files:
-                ext = Path(fname).suffix.lower()
-                if ext in SUPPORTED_EXTENSIONS:
-                    fpath = os.path.join(root, fname)
-                    content = read_source_file_safe(fpath)
-                    if not content:
+                yield str(p), p.stat().st_size
+            except OSError:
+                yield str(p), 0
+        elif p.is_dir():
+            for root, dirs, files in os.walk(str(p), followlinks=False):
+                dirs[:] = [sub for sub in dirs if sub not in IGNORED_DIRS]
+                for fname in files:
+                    if Path(fname).suffix.lower() not in SUPPORTED_EXTENSIONS:
                         continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        yield fpath, os.stat(fpath).st_size
+                    except OSError:
+                        yield fpath, 0
 
-                    scanned_files += 1
-                    findings = scan_file(fpath, content=content)
 
-                    if (use_jev or use_kev) and findings:
-                        for item in findings:
-                            try:
-                                verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
-                                if verdict:
-                                    item["jev_eval"] = verdict
-                            except Exception as e:
-                                sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
+def _batches(files, batch_bytes):
+    """Groups (fpath, size) pairs into batches bounded by total size.
 
-                    if deep_scan:
-                        try:
-                            deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
-                            if deep_findings:
-                                findings.extend(deep_findings)
-                        except Exception as e:
-                            sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
+    A single file larger than the budget becomes its own batch rather than being
+    dropped, so a pathological input still gets scanned and reports progress.
+    """
+    batch, total = [], 0
+    for fpath, size in files:
+        if batch and total + size > batch_bytes:
+            yield batch
+            batch, total = [], 0
+        batch.append(fpath)
+        total += size
+    if batch:
+        yield batch
 
-                    all_findings.extend(findings)
+
+def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file):
+    """Scans a single file. Returns (counted_bool, findings)."""
+    content = read_source_file_safe(fpath)
+    if not content:
+        return False, []
+
+    findings = scan_file(fpath, content=content)
+
+    if (use_jev or use_kev) and findings:
+        for item in findings:
+            try:
+                verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
+                if verdict:
+                    item["jev_eval"] = verdict
+            except Exception as e:
+                sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
+
+    if deep_scan:
+        try:
+            deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
+            if deep_findings:
+                findings.extend(deep_findings)
+        except Exception as e:
+            sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
+
+    return True, findings
+
+
+def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
+                 batch_bytes=DEFAULT_BATCH_BYTES, progress=True):
+    """Scans target paths, partitioned into byte-budgeted batches.
+
+    A large tree is split so that progress is observable and a timeout costs one
+    batch rather than the whole sweep. Findings accumulate across all batches, so
+    the return value is identical whether or not batching occurs.
+
+    Returns (scanned_count, all_findings).
+    """
+    if batch_bytes is None or batch_bytes < MIN_BATCH_BYTES:
+        batch_bytes = MIN_BATCH_BYTES
+
+    all_findings = []
+    scanned_files = 0
+
+    enumerated = list(_iter_target_files(targets))
+    batches = list(_batches(enumerated, batch_bytes))
+
+    if progress and len(batches) > 1:
+        total_bytes = sum(sz for _, sz in enumerated)
+        sys.stderr.write(
+            f"[*] {len(enumerated)} files, {total_bytes / 1_048_576:.1f} MiB "
+            f"across {len(batches)} batches of {batch_bytes / 1_048_576:.0f} MiB\n"
+        )
+
+    for idx, batch in enumerate(batches, start=1):
+        batch_found = 0
+        for fpath in batch:
+            counted, findings = _scan_one(fpath, use_jev, use_kev, deep_scan, env_file)
+            if counted:
+                scanned_files += 1
+            if findings:
+                batch_found += len(findings)
+                all_findings.extend(findings)
+
+        if progress and len(batches) > 1:
+            sys.stderr.write(
+                f"[*] batch {idx}/{len(batches)}: {len(batch)} files, "
+                f"{batch_found} findings (running total {len(all_findings)})\n"
+            )
 
     return scanned_files, all_findings

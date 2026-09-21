@@ -157,5 +157,71 @@ class TestDetermifyScanner(unittest.TestCase):
             _post_json("file:///etc/passwd", {}, headers={}, timeout=1)
         self.assertIn("Refusing non-HTTP(S) endpoint", str(ctx.exception))
 
+    def test_batching_preserves_findings(self):
+        """A tree split across many small batches must find exactly what one pass finds."""
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(8):
+                with open(os.path.join(d, f"m{i}.py"), "w") as fh:
+                    fh.write(
+                        'prompt = "what is today\'s date"\n'
+                        'client.messages.create(model="x", messages=[{"role":"user","content":prompt}])\n'
+                    )
+            unbudgeted_n, unbudgeted = scan_targets([d], batch_bytes=10**9, progress=False)
+            batched_n, batched = scan_targets([d], batch_bytes=1, progress=False)
+
+            self.assertEqual(unbudgeted_n, batched_n)
+            self.assertEqual(
+                {(f["file"], f["line"], f["id"]) for f in unbudgeted},
+                {(f["file"], f["line"], f["id"]) for f in batched},
+                "Batching changed the findings",
+            )
+            self.assertTrue(batched, "Expected findings from the fixture tree")
+
+    def test_batching_keeps_oversized_file(self):
+        """A single file larger than the budget is its own batch, never dropped."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.py")
+            with open(p, "w") as fh:
+                fh.write('prompt = "what is today\'s date"\n')
+                fh.write("x = 1\n" * 50000)  # well over the 1 byte budget
+            n, findings = scan_targets([d], batch_bytes=1, progress=False)
+            self.assertEqual(n, 1, "Oversized file was skipped")
+            self.assertTrue(any(f["id"] == "DET-01" for f in findings))
+
+    def test_progress_goes_to_stderr_not_stdout(self):
+        """--json output must stay pipeable; progress belongs on stderr.
+
+        Files must exceed MIN_BATCH_BYTES so the run genuinely splits, otherwise
+        the single-batch case correctly emits no chatter at all.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(3):
+                with open(os.path.join(d, f"m{i}.py"), "w") as fh:
+                    fh.write("prompt = 'what is today\\'s date'\n")
+                    fh.write("x = 1\n" * 120000)  # each file > MIN_BATCH_BYTES
+
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                scan_targets([d], batch_bytes=1_000_000, progress=True)
+
+            self.assertEqual(out.getvalue(), "", "Progress leaked to stdout")
+            self.assertIn("batch", err.getvalue(), "Expected per-batch progress on stderr")
+
+    def test_progress_silent_for_single_batch(self):
+        """A tree that fits one batch should not emit batch chatter."""
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "m.py"), "w") as fh:
+                fh.write("x = 1\n")
+
+            import io
+            from contextlib import redirect_stderr
+            err = io.StringIO()
+            with redirect_stderr(err):
+                scan_targets([d], batch_bytes=10**9, progress=True)
+
+            self.assertNotIn("batch", err.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,10 @@ def _run_cli():
     parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for sub-90ms local triage")
     parser.add_argument("--deep", action="store_true", help="Execute deep semantic chunk analysis to detect unflagged AI waste (requires --jev or --kev)")
     parser.add_argument("--env-file", default=None, help="Explicit path to .env file containing OPENROUTER_API_KEY")
+    parser.add_argument("--batch-mb", type=int, default=None,
+                        help="Split large trees into batches of this many MiB, reporting progress to stderr. "
+                             "Default 50. Batching never changes the findings, only how much work happens per step.")
+    parser.add_argument("--no-progress", action="store_true", help="Suppress per-batch progress on stderr")
     parser.add_argument("--fail-on-findings", action="store_true", help="Exit with code 1 if any actionable findings are discovered (for CI/CD)")
     parser.add_argument("--json", action="store_true", help="Output findings in JSON format")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
@@ -63,7 +67,9 @@ def _run_cli():
             use_jev=args.jev,
             use_kev=args.kev,
             deep_scan=args.deep,
-            env_file=args.env_file
+            env_file=args.env_file,
+            batch_bytes=(args.batch_mb * 1_048_576) if args.batch_mb else None,
+            progress=not args.no_progress
         )
     except Exception as e:
         sys.stderr.write(f"Fatal error during scan: {e}\n")
