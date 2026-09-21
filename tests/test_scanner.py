@@ -4,13 +4,17 @@ test_scanner.py - Comprehensive Unit Tests & Adversarial Stress Tests for Determ
 
 import os
 import sys
+import re
+import json
 import time
 import unittest
+from unittest.mock import patch
 import tempfile
 import subprocess
 from pathlib import Path
 from determify.scanner import scan_file, scan_targets, read_source_file_safe
-from determify.jev_evaluator import _post_json
+from determify.jev_evaluator import _post_json, get_api_key
+from determify.patterns import PATTERNS, MAX_GAP, _cue
 
 class TestDetermifyScanner(unittest.TestCase):
 
@@ -222,6 +226,220 @@ class TestDetermifyScanner(unittest.TestCase):
                 scan_targets([d], batch_bytes=10**9, progress=True)
 
             self.assertNotIn("batch", err.getvalue())
+
+    def test_shipped_patterns_are_not_quadratic(self):
+        self.assertEqual(MAX_GAP, 250)
+        helper = _cue(r"what\s+is\s+today'?s\s+date")
+        self.assertFalse(helper.flags & re.DOTALL)
+        self.assertNotIn(".*?", helper.pattern)
+        self.assertIn("{0,250}", helper.pattern)
+        bomb = ("what is today's date " * 8000)
+        t0 = time.perf_counter()
+        self.assertIsNone(helper.search(bomb))
+        self.assertLess(time.perf_counter() - t0, 0.5)
+        for pattern in PATTERNS:
+            self.assertFalse(pattern["regex"].flags & re.DOTALL, pattern["id"])
+            self.assertNotIn(".*?", pattern["regex"].pattern, pattern["id"])
+
+    def test_dev_zero_symlink_does_not_bomb(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = os.path.join(td, "bomb.py")
+            os.symlink("/dev/zero", link)
+            t0 = time.perf_counter()
+            content = read_source_file_safe(link)
+            elapsed = time.perf_counter() - t0
+            self.assertEqual(content, "")
+            self.assertLess(elapsed, 0.5)
+            t1 = time.perf_counter()
+            scanned, findings = scan_targets([td], progress=False)
+            self.assertEqual(scanned, 0)
+            self.assertEqual(findings, [])
+            self.assertLess(time.perf_counter() - t1, 0.5)
+
+    def test_scan_targets_fifo_does_not_hang(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.mkfifo(os.path.join(td, "pipe.py"))
+            t0 = time.perf_counter()
+            scanned, findings = scan_targets([td], progress=False)
+            self.assertEqual(scanned, 0)
+            self.assertEqual(findings, [])
+            self.assertLess(time.perf_counter() - t0, 0.5, "FIFO in the tree blocked scan_targets")
+
+    def test_oversize_file_not_read(self):
+        from determify.scanner import MAX_FILE_BYTES
+        with tempfile.NamedTemporaryFile("wb", suffix=".py", delete=False) as handle:
+            handle.write(b"openai.chat.completions.create()\n")
+            handle.write(b"x" * (MAX_FILE_BYTES + 1))
+            name = handle.name
+        try:
+            self.assertEqual(read_source_file_safe(name), "")
+            self.assertEqual(scan_file(name), [])
+        finally:
+            os.unlink(name)
+
+    def test_symlink_secret_not_read_or_posted(self):
+        posted = []
+
+        def capture(payload, use_kev=False, env_file=None):
+            posted.append(payload)
+            return {"answers": {}}, "test"
+
+        with tempfile.TemporaryDirectory() as td:
+            secret = Path(td) / "secret.txt"
+            secret.write_text(
+                'openai.chat.completions.create(model="x", messages=[])\n'
+                "SECRET_MARKER_DO_NOT_LEAK\n"
+            )
+            link = Path(td) / "innocent.py"
+            link.symlink_to(secret)
+            with patch("determify.deep_scanner.call_decision_endpoint", capture):
+                scanned, findings = scan_targets([td], use_kev=True, deep_scan=True, progress=False)
+                scanned_direct, findings_direct = scan_targets(
+                    [str(link)], use_kev=True, deep_scan=True, progress=False
+                )
+            blob = json.dumps({"posted": posted, "findings": findings, "direct": findings_direct})
+            self.assertNotIn("SECRET_MARKER_DO_NOT_LEAK", blob)
+            self.assertEqual(scanned, 0)
+            self.assertEqual(scanned_direct, 0)
+
+    def test_env_symlink_not_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            secret = Path(td) / "secret.env"
+            secret.write_text("OPENROUTER_API_KEY=sk-FROM-SYMLINK\n")
+            link = Path(td) / ".env"
+            link.symlink_to(secret)
+            old = os.environ.pop("OPENROUTER_API_KEY", None)
+            try:
+                self.assertIsNone(get_api_key(env_file=str(link)))
+            finally:
+                if old is not None:
+                    os.environ["OPENROUTER_API_KEY"] = old
+
+    def test_redirect_does_not_forward_authorization(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {"redir_hits": 0, "steal_hits": 0, "steal_auth": None}
+
+        class Handler(BaseHTTPRequestHandler):
+            def _drain(self):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length:
+                    self.rfile.read(length)
+
+            def do_POST(self):
+                self._drain()
+                if self.path == "/redir":
+                    seen["redir_hits"] += 1
+                    port = self.server.server_address[1]
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{port}/steal")
+                    self.end_headers()
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path == "/steal":
+                    seen["steal_hits"] += 1
+                    seen["steal_auth"] = self.headers.get("Authorization")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                _post_json(
+                    f"http://127.0.0.1:{server.server_address[1]}/redir",
+                    {"probe": True},
+                    headers={"Authorization": "Bearer sk-TEST-LEAK-TOKEN", "Content-Type": "application/json"},
+                    timeout=3,
+                )
+            self.assertIn("refusing", str(ctx.exception).lower())
+            self.assertEqual(seen["redir_hits"], 1)
+            self.assertEqual(seen["steal_hits"], 0)
+            self.assertIsNone(seen["steal_auth"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_cross_origin_redirect_refused(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length:
+                    self.rfile.read(length)
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/steal")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                _post_json(
+                    f"http://127.0.0.1:{server.server_address[1]}/redir",
+                    {"probe": True},
+                    headers={"Authorization": "Bearer sk-TEST-LEAK-TOKEN", "Content-Type": "application/json"},
+                    timeout=3,
+                )
+            self.assertIn("refusing", str(ctx.exception).lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def _cli(self, args, extra_env=None):
+        cmd = [sys.executable, "-m", "determify.cli", *args]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parent.parent)
+        env.pop("OPENROUTER_API_KEY", None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
+
+    def test_kev_dead_endpoint_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "bad.py").write_text(
+                'openai.chat.completions.create(model="gpt-4o", messages=[])\n'
+            )
+            res = self._cli(["--kev", "--no-progress", td], {"KEV_ENDPOINT": "http://127.0.0.1:1/v1/systemone"})
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertNotIn("Clean", res.stdout)
+            self.assertIn("failed closed", res.stderr)
+            self.assertNotIn("Total Actionable Findings", res.stdout)
+
+    def test_deep_dead_endpoint_fails_closed_no_json_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "chunk.py").write_text('prompt = "sort these names"\n')
+            res = self._cli(
+                ["--deep", "--kev", "--json", "--no-progress", td],
+                {"KEV_ENDPOINT": "http://127.0.0.1:1/v1/systemone"},
+            )
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertNotIn("Clean", res.stdout)
+            self.assertNotIn("scanned_files", res.stdout)
+            self.assertIn("failed closed", res.stderr)
+
+    def test_cli_clean_file_still_exits_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "ok.py").write_text("x = 1\n")
+            res = self._cli([td])
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Clean", res.stdout)
 
 if __name__ == "__main__":
     unittest.main()

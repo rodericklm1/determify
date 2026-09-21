@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "determify"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deterministic Execution & Token-Avoidance Scanner. Find where code uses AI when a 3-line script or decision model is better."
 readme = "README.md"
 requires-python = ">=3.9"

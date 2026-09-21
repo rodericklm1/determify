@@ -190,18 +190,20 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file):
         for item in findings:
             try:
                 verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
-                if verdict:
-                    item["jev_eval"] = verdict
             except Exception as e:
-                sys.stderr.write(f"Warning: Decision triage failed for {item.get('file')}:{item.get('line')}: {e}\n")
+                raise RuntimeError(
+                    f"decision engine failed closed for {item.get('file')}:{item.get('line')}: {e}"
+                ) from e
+            if verdict:
+                item["jev_eval"] = verdict
 
     if deep_scan:
         try:
             deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
-            if deep_findings:
-                findings.extend(deep_findings)
         except Exception as e:
-            sys.stderr.write(f"Warning: Deep scan failed for {fpath}: {e}\n")
+            raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e
+        if deep_findings:
+            findings.extend(deep_findings)
 
     return True, findings
 

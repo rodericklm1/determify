@@ -6,6 +6,7 @@ Secure HTTP handling, redirect protection, scheme validation, and bounded respon
 import os
 import sys
 import json
+import stat
 import time
 import urllib.parse
 import urllib.request
@@ -18,36 +19,88 @@ MAX_RESPONSE_BYTES = 256_000
 ALLOWED_SCHEMES = ("http", "https")
 
 class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuses automatic redirects to prevent credential and state exfiltration."""
+    """Refuse every redirect and strip Authorization so it cannot be copied."""
+
+    @staticmethod
+    def _strip_authorization(req):
+        for store_name in ("headers", "unredirected_hdrs"):
+            store = getattr(req, store_name, None)
+            if not isinstance(store, dict):
+                continue
+            for key in list(store):
+                if str(key).lower() == "authorization":
+                    del store[key]
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise RuntimeError(f"Security violation: Refusing HTTP redirect ({code}) to {newurl}")
+        self._strip_authorization(req)
+        raise RuntimeError(f"Security violation: refusing HTTP redirect ({code}) to {newurl}")
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        self._strip_authorization(req)
+        try:
+            fp.close()
+        except Exception:
+            pass
+        location = ""
+        if headers is not None:
+            location = (
+                headers.get("Location")
+                or headers.get("location")
+                or headers.get("URI")
+                or headers.get("uri")
+                or ""
+            )
+        raise RuntimeError(f"Security violation: refusing HTTP redirect ({code}) to {location}")
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+def _read_regular_nofollow(path: Path, limit: int = 65_536) -> str:
+    """Read a regular file. Symlinks, FIFOs, and devices return empty."""
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return ""
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            fd = None
+            return handle.read(limit)
+    except OSError:
+        return ""
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
 
 def get_api_key(env_file=None):
     """
-    Resolves OPENROUTER_API_KEY from environment or explicit local .env file.
-    Does NOT walk parent directories or $HOME to prevent accidental key exposure.
+    Resolves OPENROUTER_API_KEY from environment or an explicit local .env file.
+    Does NOT walk parent directories or $HOME, and does not follow symlinks.
     """
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key.strip().strip("\"'")
 
     target_env = Path(env_file) if env_file else Path.cwd() / ".env"
-    if target_env.exists() and target_env.is_file():
-        try:
-            with open(target_env, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.startswith("export "):
-                        line = line[7:].strip()
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        val = line.split("=", 1)[1].strip()
-                        # Strip trailing comments
-                        val = val.split(" #", 1)[0].strip()
-                        return val.strip("\"'")
-        except Exception:
-            pass
+    text = _read_regular_nofollow(target_env)
+    if not text:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if line.startswith("OPENROUTER_API_KEY="):
+            val = line.split("=", 1)[1].strip()
+            val = val.split(" #", 1)[0].strip()
+            return val.strip("\"'")
     return None
 
 def get_kev_url():

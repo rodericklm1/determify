@@ -56,11 +56,6 @@ def _run_cli():
             )
             sys.exit(2)
 
-    # Destination transparency warning
-    if (args.jev or args.kev) and not args.json:
-        dest = get_kev_url() if args.kev else OPENROUTER_DECISIONS_URL
-        print(f"[*] Decision Engine Active: Triage queries will be evaluated by {dest}")
-
     try:
         scanned_files, all_findings = scan_targets(
             args.path,
@@ -72,8 +67,14 @@ def _run_cli():
             progress=not args.no_progress
         )
     except Exception as e:
-        sys.stderr.write(f"Fatal error during scan: {e}\n")
+        # Fail closed: stderr + exit 2, and do not print a clean or success report.
+        sys.stderr.write(f"Error: decision engine failed closed: {e}\n")
         sys.exit(2)
+
+    # Destination banner only after the scan actually completed.
+    if (args.jev or args.kev) and not args.json:
+        dest = get_kev_url() if args.kev else OPENROUTER_DECISIONS_URL
+        print(f"[*] Decision Engine Active: Triage queries will be evaluated by {dest}")
 
     # Format findings with relative paths for both JSON and terminal
     cwd = Path.cwd().resolve()
