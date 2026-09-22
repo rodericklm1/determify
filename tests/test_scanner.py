@@ -21,7 +21,7 @@ class TestDetermifyScanner(unittest.TestCase):
     def test_det01_date_math_detection(self):
         content = """
         def get_date():
-            prompt = "What is today's date? Please calculate the date for tomorrow."
+            prompt = "What is today's date? Please generate the full breakdown."
             return client.messages.create(model="claude-3-5-sonnet", messages=[{"role": "user", "content": prompt}])
         """
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
@@ -36,7 +36,7 @@ class TestDetermifyScanner(unittest.TestCase):
     def test_det02_file_discovery_with_llm(self):
         content = """
         # Ask LLM if file exists in prompt
-        prompt = "Does the file exist in the directory? List all files in dir."
+        prompt = "Does the file exist in the directory? Query the full listing."
         llm_call(prompt)
         """
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
@@ -101,7 +101,7 @@ class TestDetermifyScanner(unittest.TestCase):
             p = Path(td) / "bad_script.py"
             p.write_text("prompt = 'parse the json structure and extract the frontmatter'; llm_call(prompt)")
             
-            scanned, findings = scan_targets([td])
+            scanned, findings, _ = scan_targets([td])
             self.assertEqual(scanned, 1)
             self.assertGreaterEqual(len(findings), 1)
             self.assertEqual(findings[0]["id"], "DET-03")
@@ -128,7 +128,7 @@ class TestDetermifyScanner(unittest.TestCase):
     # --- Red-Team Adversarial Tests ---
 
     def test_redos_prefix_bomb_budget(self):
-        """Tests that a pathological prefix-bomb executes in <500ms and avoids ReDoS."""
+        """Tests that a pathological prefix-bomb stays linear (<1s for 180KB, two bounded branches at ~2x single-branch cost)."""
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
             f.write("format date " * 15000)
             f.flush()
@@ -137,7 +137,7 @@ class TestDetermifyScanner(unittest.TestCase):
             elapsed = time.perf_counter() - t0
         
         os.unlink(f.name)
-        self.assertLess(elapsed, 0.5, f"ReDoS vulnerability detected: took {elapsed:.2f}s")
+        self.assertLess(elapsed, 1.0, f"ReDoS vulnerability detected: took {elapsed:.2f}s")
 
     def test_fifo_does_not_hang(self):
         """Tests that FIFOs / pipes are safely rejected without blocking."""
@@ -170,8 +170,8 @@ class TestDetermifyScanner(unittest.TestCase):
                         'prompt = "what is today\'s date"\n'
                         'client.messages.create(model="x", messages=[{"role":"user","content":prompt}])\n'
                     )
-            unbudgeted_n, unbudgeted = scan_targets([d], batch_bytes=10**9, progress=False)
-            batched_n, batched = scan_targets([d], batch_bytes=1, progress=False)
+            unbudgeted_n, unbudgeted, _ = scan_targets([d], batch_bytes=10**9, progress=False)
+            batched_n, batched, _ = scan_targets([d], batch_bytes=1, progress=False)
 
             self.assertEqual(unbudgeted_n, batched_n)
             self.assertEqual(
@@ -186,9 +186,9 @@ class TestDetermifyScanner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "big.py")
             with open(p, "w") as fh:
-                fh.write('prompt = "what is today\'s date"\n')
+                fh.write('prompt = "what is today\'s date? Generate it"\n')
                 fh.write("x = 1\n" * 50000)  # well over the 1 byte budget
-            n, findings = scan_targets([d], batch_bytes=1, progress=False)
+            n, findings, _ = scan_targets([d], batch_bytes=1, progress=False)
             self.assertEqual(n, 1, "Oversized file was skipped")
             self.assertTrue(any(f["id"] == "DET-01" for f in findings))
 
@@ -251,7 +251,7 @@ class TestDetermifyScanner(unittest.TestCase):
             self.assertEqual(content, "")
             self.assertLess(elapsed, 0.5)
             t1 = time.perf_counter()
-            scanned, findings = scan_targets([td], progress=False)
+            scanned, findings, _ = scan_targets([td], progress=False)
             self.assertEqual(scanned, 0)
             self.assertEqual(findings, [])
             self.assertLess(time.perf_counter() - t1, 0.5)
@@ -260,9 +260,10 @@ class TestDetermifyScanner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             os.mkfifo(os.path.join(td, "pipe.py"))
             t0 = time.perf_counter()
-            scanned, findings = scan_targets([td], progress=False)
+            scanned, findings, stats = scan_targets([td], progress=False)
             self.assertEqual(scanned, 0)
             self.assertEqual(findings, [])
+            self.assertEqual(stats["skipped"], 1, "FIFO must be reported as skipped")
             self.assertLess(time.perf_counter() - t0, 0.5, "FIFO in the tree blocked scan_targets")
 
     def test_oversize_file_not_read(self):
@@ -293,8 +294,8 @@ class TestDetermifyScanner(unittest.TestCase):
             link = Path(td) / "innocent.py"
             link.symlink_to(secret)
             with patch("determify.deep_scanner.call_decision_endpoint", capture):
-                scanned, findings = scan_targets([td], use_kev=True, deep_scan=True, progress=False)
-                scanned_direct, findings_direct = scan_targets(
+                scanned, findings, _ = scan_targets([td], use_kev=True, deep_scan=True, progress=False)
+                scanned_direct, findings_direct, _ = scan_targets(
                     [str(link)], use_kev=True, deep_scan=True, progress=False
                 )
             blob = json.dumps({"posted": posted, "findings": findings, "direct": findings_direct})
@@ -402,14 +403,14 @@ class TestDetermifyScanner(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def _cli(self, args, extra_env=None):
+    def _cli(self, args, extra_env=None, cwd=None):
         cmd = [sys.executable, "-m", "determify.cli", *args]
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).parent.parent)
         env.pop("OPENROUTER_API_KEY", None)
         if extra_env:
             env.update(extra_env)
-        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20, cwd=cwd)
 
     def test_kev_dead_endpoint_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -440,6 +441,185 @@ class TestDetermifyScanner(unittest.TestCase):
             res = self._cli([td])
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("Clean", res.stdout)
+
+    # --- Cue-gate regression tests (audit finding 9.1) ---
+
+    def test_det01_to_det06_are_cue_gated(self):
+        for p in PATTERNS:
+            if p["id"] == "DET-07":
+                continue
+            self.assertIn("{0,250}", p["regex"].pattern, f"{p['id']} must gate on LLM_CONTEXT_GATE")
+
+    def test_bare_cue_string_not_flagged(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write("msg = 'check if file exists'\n")
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        self.assertEqual(findings, [])
+
+    def test_docstring_cue_not_flagged(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write('def probe():\n    """Does the file exist?"""\n    return True\n')
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        self.assertEqual(findings, [])
+
+    def test_cue_adjacent_to_invocation_still_flagged(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write('resp = client.messages.create(prompt="What is today\'s date? Generate it.")\n')
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        ids = [x["id"] for x in findings]
+        self.assertIn("DET-01", ids)
+        self.assertIn("DET-07", ids)
+
+    def test_reverse_order_gate_before_cue_flags_det01(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write('client.messages.create(model="gpt-4o", prompt="What is today\'s date?")\n')
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        ids = [x["id"] for x in findings]
+        self.assertIn("DET-01", ids, "cue after the gate token must still emit DET-01")
+        self.assertIn("DET-07", ids)
+
+    # --- Deep scan reporting fixes (audit finding 9.3) ---
+
+    def test_deep_reports_first_signal_line_and_dedupes_windows(self):
+        from determify.deep_scanner import deep_scan_file
+
+        calls = []
+
+        def mock(payload, use_kev=False, env_file=None):
+            calls.append(1)
+            return {
+                "answers": {
+                    "contains_unnecessary_ai": {"noul": 0.9},
+                    "replacement_tier": {"choice": "clean_tier_0_code", "confidence": 0.42},
+                }
+            }, "mock"
+        lines = [f"v{i} = {i}" for i in range(1, 121)]
+        lines[49] = "llm = client.messages.create(model='m', messages=[])"
+        with patch("determify.deep_scanner.call_decision_endpoint", mock):
+            findings = deep_scan_file("f.py", "\n".join(lines), use_kev=True)
+        self.assertEqual(len(findings), 1, "overlapping windows must collapse to one finding")
+        self.assertEqual(len(calls), 1, "overlapping windows must not POST the same signal line twice")
+        self.assertEqual(findings[0]["line"], 50, "finding must point at the signal line")
+        self.assertEqual(findings[0]["start_line"], 1)
+        self.assertEqual(findings[0]["jev_eval"]["confidence"], 0.42, "confidence is the choice probability")
+        self.assertEqual(findings[0]["jev_eval"]["deterministic_prob"], 0.9, "deterministic_prob is the noul")
+
+    def test_deep_legitimate_generative_dropped_and_debug_records(self):
+        import io
+        from contextlib import redirect_stderr
+        from determify.deep_scanner import deep_scan_file
+
+        def mock(payload, use_kev=False, env_file=None):
+            return {
+                "answers": {
+                    "contains_unnecessary_ai": {"noul": 0.99},
+                    "replacement_tier": {"choice": "legitimate_generative", "confidence": 0.99},
+                }
+            }, "mock"
+
+        content = 'llm = client.messages.create(model="m", messages=[])\n'
+        err = io.StringIO()
+        with patch("determify.deep_scanner.call_decision_endpoint", mock), redirect_stderr(err):
+            findings = deep_scan_file("g.py", content, use_kev=True, debug=True)
+        self.assertEqual(findings, [])
+        self.assertIn("dropped", err.getvalue(), "debug flag must surface evaluated-but-dropped rows")
+
+    # --- Key resolution (audit finding 9.6) ---
+
+    def test_cwd_dotenv_not_read_implicitly(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".env").write_text("OPENROUTER_API_KEY=sk-FROM-CWD\n")
+            old = os.environ.pop("OPENROUTER_API_KEY", None)
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                self.assertIsNone(get_api_key())
+                self.assertEqual(get_api_key(env_file=str(Path(td) / ".env")), "sk-FROM-CWD")
+            finally:
+                os.chdir(prev_cwd)
+                if old is not None:
+                    os.environ["OPENROUTER_API_KEY"] = old
+
+    # --- Skip visibility and exit codes (audit findings 9.7, 9.8) ---
+
+    def test_symlink_skip_is_reported(self):
+        import io
+        from contextlib import redirect_stderr
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target.txt"
+            target.write_text('openai.chat.completions.create(model="x", messages=[])\n')
+            link = Path(td) / "link.py"
+            link.symlink_to(target)
+            err = io.StringIO()
+            with redirect_stderr(err):
+                scanned, findings, stats = scan_targets([td], progress=False)
+            self.assertEqual(scanned, 0)
+            self.assertEqual(findings, [])
+            self.assertEqual(stats["skipped"], 1)
+            self.assertIn("[skip]", err.getvalue())
+            self.assertIn("symlink", err.getvalue())
+
+    def test_unreadable_skip_is_reported(self):
+        import io
+        from contextlib import redirect_stderr
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses file permission bits")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "locked.py"
+            p.write_text('openai.chat.completions.create(model="x", messages=[])\n')
+            os.chmod(p, 0)
+            try:
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    scanned, findings, stats = scan_targets([td], progress=False)
+            finally:
+                os.chmod(p, 0o644)
+            self.assertEqual(scanned, 0)
+            self.assertEqual(stats["skipped"], 1)
+            self.assertIn("unreadable", err.getvalue())
+
+    def test_missing_path_exits_2_without_banner(self):
+        res = self._cli(["/definitely-not-a-determify-path/xyz"])
+        self.assertEqual(res.returncode, 2)
+        self.assertEqual(res.stdout, "")
+        self.assertIn("does not exist", res.stderr)
+
+    def test_json_reports_skipped_field(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.mkfifo(os.path.join(td, "pipe.py"))
+            (Path(td) / "ok.py").write_text("x = 1\n")
+            res = self._cli(["--json", "--no-progress", td])
+            data = json.loads(res.stdout)
+            self.assertEqual(data["skipped"], 1)
+
+    # --- Banner honesty and path fallback (audit findings 9.5, 9.13) ---
+
+    def test_kev_not_invoked_banner_is_honest(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "ok.py").write_text("x = 1\n")
+            res = self._cli(["--kev", "--no-progress", td], {"KEV_ENDPOINT": "http://127.0.0.1:1/v1/systemone"})
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("provider not invoked", res.stdout)
+            self.assertNotIn("Decision Engine Active", res.stdout)
+            self.assertIn("Clean", res.stdout)
+
+    def test_out_of_tree_target_reports_basename_not_home_path(self):
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as cwd:
+            target = Path(outside) / "hit.py"
+            target.write_text('openai.chat.completions.create(model="x", messages=[])\n')
+            res = self._cli(["--no-progress", str(target)], cwd=cwd)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("hit.py", res.stdout)
+            self.assertNotIn(str(Path.home()), res.stdout)
+            self.assertNotIn(outside, res.stdout)
 
 if __name__ == "__main__":
     unittest.main()

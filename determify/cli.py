@@ -26,6 +26,7 @@ def _run_cli():
     parser.add_argument("--jev", action="store_true", help="Use TypeSafe Jev via Cloud OpenRouter Decisions API for intelligent semantic triage")
     parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for sub-90ms local triage")
     parser.add_argument("--deep", action="store_true", help="Execute deep semantic chunk analysis to detect unflagged AI waste (requires --jev or --kev)")
+    parser.add_argument("--deep-debug", action="store_true", help="Log chunks the deep classifier evaluated but dropped to stderr (use with --deep)")
     parser.add_argument("--env-file", default=None, help="Explicit path to .env file containing OPENROUTER_API_KEY")
     parser.add_argument("--batch-mb", type=int, default=None,
                         help="Split large trees into batches of this many MiB, reporting progress to stderr. "
@@ -45,50 +46,71 @@ def _run_cli():
         )
         sys.exit(2)
 
+    # Missing targets are a usage error, not a clean scan: fail before printing anything
+    missing = [t for t in args.path if not Path(t).exists()]
+    if missing:
+        for t in missing:
+            sys.stderr.write(f"Error: Target path does not exist: {t}\n")
+        sys.exit(2)
+
     # Pre-flight check for Cloud Jev
     if args.jev and not args.kev:
         key = get_api_key(env_file=args.env_file)
         if not key:
             sys.stderr.write(
-                "Error: OPENROUTER_API_KEY not found in environment or local .env.\n"
-                "To use Cloud Jev triage, set OPENROUTER_API_KEY or specify --env-file.\n"
+                "Error: OPENROUTER_API_KEY not found in environment.\n"
+                "To use Cloud Jev triage, export OPENROUTER_API_KEY or specify --env-file.\n"
                 "To use on-prem triage without an API key, use --kev.\n"
             )
             sys.exit(2)
 
     try:
-        scanned_files, all_findings = scan_targets(
+        scanned_files, all_findings, stats = scan_targets(
             args.path,
             use_jev=args.jev,
             use_kev=args.kev,
             deep_scan=args.deep,
             env_file=args.env_file,
             batch_bytes=(args.batch_mb * 1_048_576) if args.batch_mb else None,
-            progress=not args.no_progress
+            progress=not args.no_progress,
+            deep_debug=args.deep_debug
         )
     except Exception as e:
         # Fail closed: stderr + exit 2, and do not print a clean or success report.
         sys.stderr.write(f"Error: decision engine failed closed: {e}\n")
         sys.exit(2)
 
-    # Destination banner only after the scan actually completed.
-    if (args.jev or args.kev) and not args.json:
+    invoked = stats["invoked"]
+
+    # Destination banner only after a provider call actually returned.
+    if (args.jev or args.kev) and invoked and not args.json:
         dest = get_kev_url() if args.kev else OPENROUTER_DECISIONS_URL
-        print(f"[*] Decision Engine Active: Triage queries will be evaluated by {dest}")
+        print(f"[*] Decision Engine Active: Triage queries were evaluated by {dest}")
 
     # Format findings with relative paths for both JSON and terminal
     cwd = Path.cwd().resolve()
+    roots = [Path(t).resolve() for t in args.path]
     for f in all_findings:
+        f_path = Path(f["file"]).resolve()
+        rel = None
         try:
-            f_path = Path(f["file"]).resolve()
-            f["file"] = str(f_path.relative_to(cwd))
+            rel = f_path.relative_to(cwd)
         except ValueError:
-            pass
+            for root in roots:
+                try:
+                    candidate = f_path.relative_to(root)
+                except ValueError:
+                    continue
+                if str(candidate) != ".":
+                    rel = candidate
+                    break
+        f["file"] = str(rel) if rel is not None else f_path.name
 
     if args.json:
         result = {
             "version": __version__,
             "scanned_files": scanned_files,
+            "skipped": stats["skipped"],
             "total_findings": len(all_findings),
             "findings": all_findings
         }
@@ -99,22 +121,29 @@ def _run_cli():
 
     print("======================================================================")
     print("⚡ determify: Deterministic Execution & Token-Avoidance Scanner")
-    mode_desc = "Static Lexical Analysis"
-    if args.deep:
+    if invoked:
         provider = "Kev-0.6B (Local)" if args.kev else "Jev (Cloud)"
-        mode_desc = f"Deep Semantic Codebase Sweep (--deep via {provider})"
-    elif args.kev:
-        mode_desc = "Kev-0.6B On-Prem Intelligent Triage (--kev)"
-    elif args.jev:
-        mode_desc = "Jev-Stacked Intelligent Triage (--jev)"
+        if args.deep:
+            mode_desc = f"Deep Semantic Codebase Sweep (--deep via {provider})"
+        elif args.kev:
+            mode_desc = "Kev-0.6B On-Prem Intelligent Triage (--kev)"
+        else:
+            mode_desc = "Jev-Stacked Intelligent Triage (--jev)"
+    elif args.kev or args.jev:
+        mode_desc = "Static Lexical Analysis (provider not invoked)"
+    else:
+        mode_desc = "Static Lexical Analysis"
 
     print(f"   Mode: {mode_desc}")
     print("   Rule: Never use an LLM if a 3-line script solves it.")
     print("======================================================================")
-    print(f"[*] Scanned {scanned_files} files across target paths.\n")
+    print(f"[*] Scanned {scanned_files} files across target paths ({stats['skipped']} skipped).\n")
 
     if scanned_files == 0:
-        print("⚠️  No supported files found to scan in target paths.")
+        if stats["skipped"]:
+            print(f"⚠️  No files were scanned: {stats['skipped']} skipped (see stderr).")
+        else:
+            print("⚠️  No supported files found to scan in target paths.")
         print("======================================================================")
         return
 

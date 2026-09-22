@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
     - uses: actions/checkout@v4
@@ -32,5 +32,16 @@ jobs:
 
     - name: Test CLI self-scan
       run: |
-        determify .
-        determify . --json
+        determify . --fail-on-findings
+        determify . --json --fail-on-findings
+
+    - name: Missing path must exit 2
+      run: |
+        set +e
+        determify ./does-not-exist > /dev/null 2>&1
+        code=$?
+        if [ "$code" -ne 2 ]; then
+          echo "expected exit 2 for missing path, got $code"
+          exit 1
+        fi
+        exit 0

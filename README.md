@@ -166,24 +166,15 @@ flowchart LR
     class SCAN scanner;
 ```
 
-### Empirical latency and cost comparison
-
-| Metric | Pure frontier LLMs | Tiered architecture (determify + Jev/Kev) | Impact |
-| :--- | :--- | :--- | :--- |
-| **Decision latency (p50)** | 5,400 ms (frontier LLM) | **<75 ms** (Kev-0.6B / Jev) | **72x faster** |
-| **Deterministic data latency** | 2,800 ms (frontier LLM) | **<2 ms** (POSIX / Python stdlib) | **1,400x faster** |
-| **Prompt token consumption** | High (full prompt history) | **Minimal** (eliminated or compressed) | **Up to 90%+ fewer tokens** |
-| **Hallucination risk on data ops** | Non-zero | **0.00%** | **Eliminated on Tier 0 and Tier 0.5** |
-
 ---
 
 ## 🤝 Ecosystem compatibility
 
-`determify` recognizes LLM call patterns across common stacks and languages:
+`determify`'s DET-07 rule matches these literal call and CLI signatures:
 
-- **Python and TypeScript.** OpenAI, Anthropic, Google GenAI, LangChain, LlamaIndex, CrewAI, AutoGen.
-- **Agent CLIs and subprocesses.** Claude Code, Cursor, Aider, Hermes, SGPT.
-- **POSIX shell and scripts.** Bash, Zsh, Cron, CI/CD runners.
+- **SDK call sites.** `openai.completions.create`, `openai.chat.completions.create`, `anthropic.messages.create`, `client.chat.completions`, `client.messages.create`, `client.responses.create`, `llm.complete`, `model.generate_content`.
+- **Chat model classes.** `ChatOpenAI(...)`, `ChatAnthropic(...)` (LangChain).
+- **Agent CLIs and subprocesses.** `opencode run`, `hermes run`, `claude -p`, `sgpt -s/-o/-e/-c`.
 
 ---
 

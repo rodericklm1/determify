@@ -4,7 +4,6 @@ Secure HTTP handling, redirect protection, scheme validation, and bounded respon
 """
 
 import os
-import sys
 import json
 import stat
 import time
@@ -80,15 +79,17 @@ def _read_regular_nofollow(path: Path, limit: int = 65_536) -> str:
 
 def get_api_key(env_file=None):
     """
-    Resolves OPENROUTER_API_KEY from environment or an explicit local .env file.
-    Does NOT walk parent directories or $HOME, and does not follow symlinks.
+    Resolves OPENROUTER_API_KEY from the environment, or from an explicitly
+    requested .env file. Never reads the implicit cwd .env, does not walk parent
+    directories or $HOME, and does not follow symlinks.
     """
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key.strip().strip("\"'")
 
-    target_env = Path(env_file) if env_file else Path.cwd() / ".env"
-    text = _read_regular_nofollow(target_env)
+    if not env_file:
+        return None
+    text = _read_regular_nofollow(Path(env_file))
     if not text:
         return None
     for line in text.splitlines():
@@ -155,8 +156,8 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None):
     api_key = get_api_key(env_file=env_file)
     if not api_key:
         raise ValueError(
-            "OPENROUTER_API_KEY not found in environment or local .env.\n"
-            "To use cloud Jev triage, set OPENROUTER_API_KEY, or use --kev for on-prem triage."
+            "OPENROUTER_API_KEY not found in environment.\n"
+            "To use cloud Jev triage, export OPENROUTER_API_KEY or pass --env-file, or use --kev for on-prem triage."
         )
 
     headers = {

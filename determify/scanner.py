@@ -21,7 +21,7 @@ SUPPORTED_EXTENSIONS = {
     ".py", ".ts", ".js", ".jsx", ".tsx", ".sh", ".bash"
 }
 
-MAX_FILE_BYTES = 1_000_000  # 1 MiB cap prevents memory exhaustion on minified bundles
+MAX_FILE_BYTES = 1_000_000  # 1,000,000 byte cap prevents memory exhaustion on minified bundles
 
 # Batch budget: bound how much work one scan pass does before reporting progress.
 # Bytes, not file count, because bytes are what bound wall-clock time.
@@ -29,30 +29,37 @@ MAX_FILE_BYTES = 1_000_000  # 1 MiB cap prevents memory exhaustion on minified b
 DEFAULT_BATCH_BYTES = 50_000_000  # 50 MiB per batch
 MIN_BATCH_BYTES = 1_000_000        # never let a caller set a batch below one file cap
 
-def read_source_file_safe(file_path: str) -> str:
+def read_source_file_safe(file_path: str, stats: dict = None) -> str:
     """
     Safely opens and reads a regular file without following symlinks.
     Blocks FIFOs, character devices (/dev/zero), and oversized files.
     Uses O_NONBLOCK so opening a FIFO fails immediately rather than blocking.
+    Every skip is reported on stderr and counted in stats["skipped"] when given.
     """
+    def _skip(reason):
+        sys.stderr.write(f"[skip] {file_path}: {reason}\n")
+        if stats is not None:
+            stats["skipped"] += 1
+        return ""
+
     fd = None
     try:
         # O_NONBLOCK prevents hanging if path is a FIFO
         fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except (OSError, IOError):
-        return ""
+    except OSError as e:
+        return _skip("symlink" if e.errno == errno.ELOOP else "unreadable")
 
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            return ""
+            return _skip("not a regular file")
         if st.st_size > MAX_FILE_BYTES:
-            return ""
+            return _skip(f"over {MAX_FILE_BYTES} bytes")
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = None  # fdopen transfers ownership
             return f.read(MAX_FILE_BYTES)
     except Exception:
-        return ""
+        return _skip("unreadable")
     finally:
         if fd is not None:
             try:
@@ -178,9 +185,9 @@ def _batches(files, batch_bytes):
         yield batch
 
 
-def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file):
+def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=False):
     """Scans a single file. Returns (counted_bool, findings)."""
-    content = read_source_file_safe(fpath)
+    content = read_source_file_safe(fpath, stats)
     if not content:
         return False, []
 
@@ -196,10 +203,13 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file):
                 ) from e
             if verdict:
                 item["jev_eval"] = verdict
+                stats["invoked"] = True
 
     if deep_scan:
         try:
-            deep_findings = deep_scan_file(fpath, content, use_kev=use_kev, env_file=env_file)
+            deep_findings = deep_scan_file(
+                fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug
+            )
         except Exception as e:
             raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e
         if deep_findings:
@@ -209,20 +219,22 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file):
 
 
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
-                 batch_bytes=DEFAULT_BATCH_BYTES, progress=True):
+                 batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False):
     """Scans target paths, partitioned into byte-budgeted batches.
 
     A large tree is split so that progress is observable and a timeout costs one
     batch rather than the whole sweep. Findings accumulate across all batches, so
     the return value is identical whether or not batching occurs.
 
-    Returns (scanned_count, all_findings).
+    Returns (scanned_count, all_findings, stats) where stats tracks skipped files
+    and whether any decision-engine call actually returned.
     """
     if batch_bytes is None or batch_bytes < MIN_BATCH_BYTES:
         batch_bytes = MIN_BATCH_BYTES
 
     all_findings = []
     scanned_files = 0
+    stats = {"skipped": 0, "invoked": False}
 
     enumerated = list(_iter_target_files(targets))
     batches = list(_batches(enumerated, batch_bytes))
@@ -237,7 +249,7 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
     for idx, batch in enumerate(batches, start=1):
         batch_found = 0
         for fpath in batch:
-            counted, findings = _scan_one(fpath, use_jev, use_kev, deep_scan, env_file)
+            counted, findings = _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug)
             if counted:
                 scanned_files += 1
             if findings:
@@ -250,4 +262,4 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
                 f"{batch_found} findings (running total {len(all_findings)})\n"
             )
 
-    return scanned_files, all_findings
+    return scanned_files, all_findings, stats
