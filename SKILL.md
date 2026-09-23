@@ -97,18 +97,21 @@ determify . --json
 On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON. If output might be large, inspect the summary headers and sample findings first:
 
 ```bash
-determify . --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f[\"id\"]}] {f[\"file\"]}:{f[\"line\"]} -> {f[\"name\"]}') for f in d.get('findings',[])[:15]]"
+determify . --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]"
 ```
 
-**Large Tree Handling:** Determify automatically batches by byte-budget (50MB per batch). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume—a terminated scan must be re-run from the start.
+**Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MiB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume—a terminated scan must be re-run from the start.
 
 ### 3. Optional Deep Semantic Inspection (`--deep`)
 If the user specifically asks for deep or semantic triage:
-* `--deep` sends 60-line code chunks to an external endpoint and **strictly requires an explicit provider flag** (`--kev` for local or `--jev` for cloud) to prevent accidental source code exfiltration.
-* Ensure local Kev (`http://localhost:8009/v1/systemone`) or `OPENROUTER_API_KEY` is configured before running:
+* `--deep` sends 60-line source code chunks to an external decision engine and **strictly requires an explicit provider flag** (`--kev` for local or `--jev` for cloud) to prevent accidental transmission of source code.
+* **Local Kev (`--kev`):** Runs air-gapped on localhost with zero data leaving the host. Ensure your local Kev endpoint (defaulting to `http://localhost:8009/v1/systemone` or `$KEV_ENDPOINT`) is running before executing:
   ```bash
   determify . --deep --kev --json
   ```
+* **Cloud Jev (`--jev` Consent Gate):** **MANDATORY PERMISSION REQUIRED.** Running `--deep --jev` transmits 60-line source code chunks over HTTPS to OpenRouter's cloud decisions endpoint. Before running this command, you **must plainly state** that source code chunks will leave the machine and obtain explicit user authorization:
+  > *"Running `--deep --jev` will transmit 60-line source code chunks to OpenRouter's cloud decisions API (`https://openrouter.ai/api/alpha/decisions`). Do you authorize sending code from this repository to the cloud for semantic triage?"*
+  Only proceed with `determify . --deep --jev --json` after receiving explicit consent and ensuring `OPENROUTER_API_KEY` is set.
 
 ### 4. Synthesize the Executive Briefing
 Synthesize the structured findings for the user:
