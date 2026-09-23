@@ -47,6 +47,24 @@ flowchart TD
 
 ---
 
+## 🤖 Point Your AI at Determify (Universal Agent Skill)
+
+You don't need to configure Determify, remember rule IDs, or learn CLI flags. You can point any AI coding assistant (**Claude Code**, **Cursor**, **OpenCode**, **Codex**, **Hermes**, **Roo Code**, or any agent) directly at this repository to audit and optimize your code:
+
+### Direct Agent Prompt
+Tell your AI assistant in any project:
+> *"Read https://raw.githubusercontent.com/rodericklm1/determify/main/SKILL.md and help me audit this codebase for unnecessary LLM calls."*
+
+### Open Agent Skills CLI
+Install into your preferred agent harness using the open skills standard:
+```bash
+npx skills add rodericklm1/determify
+```
+
+The AI skill handles environment checking and CLI execution under the hood, interprets the findings by architectural tier (Tier 0 vs Tier 0.5 vs Tier 2+), and **collaborates with you on every change**—proposing concrete diffs and waiting for your approval before modifying code.
+
+---
+
 ## 🚀 Installation
 
 ```bash
