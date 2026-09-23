@@ -1,16 +1,20 @@
 ---
 name: determify
-description: "Autonomously set up and execute Determify CLI to audit codebases for deterministic AI waste (date math, file checks, JSON/YAML parsing, formatting, or ungated SDK calls), interpret the findings, and collaborate with the user on surgical refactoring. Handles all CLI verification and execution automatically. Use when asked to 'audit tokens', 'determify this repo', 'find LLM waste', 'reduce AI costs/latency', or optimize agentic code."
+description: "Set up (with user consent) and execute the Determify CLI to audit codebases for deterministic AI waste (date math, file checks, JSON/YAML parsing, formatting, or ungated SDK calls), interpret findings, and collaboratively refactor code. Handles all CLI verification and execution automatically. Use when asked to 'audit tokens', 'determify this repo', 'find LLM waste', 'reduce AI costs/latency', or optimize agentic code."
 license: MIT
+compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
+metadata:
+  version: "0.1.2"
+  repository: "https://github.com/rodericklm1/determify"
 ---
 
 # Determify (Universal Deterministic Execution & Token-Avoidance Skill)
 
 > **"Never use an LLM if a 3-line Bash script solves it for zero tokens, zero latency, and zero hallucinations."**
 
-This skill equips an AI coding assistant (Claude Code, Cursor, OpenCode, Codex, Hermes, Roo Code, etc.) to act as a **collaborative architectural partner**. 
+This skill equips an AI coding assistant (Claude Code, Cursor, OpenCode, Codex, Hermes, Roo Code, etc.) to act as a **collaborative architectural partner**.
 
-You do not ask the user to configure or learn CLI flags. You handle tool availability and execution under the hood, synthesize the findings into clear architectural tiers, and **collaborate with the user on every code change**. You never execute unconfirmed mass-refactors or run the user's live application.
+You do not ask the user to configure or learn CLI flags. You handle tool availability and execution, synthesize the findings into clear architectural tiers, and **collaborate with the user on every code change**. You never execute unconfirmed mass-refactors, install software without consent, or run the user's live application.
 
 ---
 
@@ -18,11 +22,13 @@ You do not ask the user to configure or learn CLI flags. You handle tool availab
 
 Every task in an agentic or software workflow belongs to one of three tiers:
 
-| Tier | Technology | Economics & Latency | Best Used For |
+| Tier | Technology | Economics & Latency (illustrative, not benchmarked) | Best Used For |
 | :--- | :--- | :--- | :--- |
 | **Tier 0: Pure Determinism** | POSIX Bash / Python stdlib / regex / system calls | **$0.00 • 0ms • 0% hallucination** | Date/time math, file/path existence, JSON/YAML parsing, document sizing, string cleaning, literal keyword checks. |
-| **Tier 0.5: Fast Decision Model** | TypeSafe Jev / On-Prem Kev-0.6B | **$0.000042 • <100ms** | Binary gating, classification, intent routing, rubric scoring, filtering. Emits zero output tokens. |
-| **Tier 2+: Generative Frontier LLM** | Frontier models (Claude, GPT, Gemini) | **$3–$15/MTok • 2,000–8,000ms** | Open-ended synthesis, creative prose, complex multi-hop reasoning, code generation. |
+| **Tier 0.5: Fast Decision Model** | Operator-supplied decision service (e.g. TypeSafe Jev, on-prem Kev-0.6B) | Cost and latency depend on the operator's service; not shipped with this tool | Binary gating, classification, intent routing, rubric scoring, filtering. |
+| **Tier 2+: Generative Frontier LLM** | Frontier models (Claude, GPT, Gemini) | Metered per token; typically seconds of latency | Open-ended synthesis, creative prose, complex multi-hop reasoning, code generation. |
+
+> **Note on Tier 0.5:** Fast decision services (such as Jev or Kev) are **external operator-supplied infrastructure**, not bundled inside Determify. Mention them only as an architectural option if the user already operates such a service. Never propose an integration the user does not have.
 
 ---
 
@@ -31,41 +37,54 @@ Every task in an agentic or software workflow belongs to one of three tiers:
 1. **The Determify Principle (Don't Use AI to Find AI Waste):**
    * **STRICTLY PROHIBITED:** Ingesting dozens or hundreds of project files into your LLM prompt context to manually "hunt" for LLM calls. This burns thousands of tokens, introduces hallucination risk, and violates the tool's core premise.
    * **MANDATORY:** Always run `determify <path> --json` via your Bash/command tool. Let the deterministic CLI isolate exact call sites in milliseconds for $0.00.
-2. **The Collaborative Invariant (No Unilateral Edits):**
-   * **STRICTLY PROHIBITED:** Mass-editing or auto-fixing call sites across the user's codebase without explicit per-site confirmation.
-   * **MANDATORY:** Present each finding, explain the trade-offs, show a concrete side-by-side diff, and ask the user for approval.
+2. **The Collaborative Invariant (No Unilateral Edits or Installs):**
+   * **STRICTLY PROHIBITED:** Mass-editing or auto-fixing call sites across the user's codebase without explicit per-site confirmation. Installing software into the user's environment without stating what will be installed, from where, and receiving consent.
+   * **MANDATORY:** Present each finding, explain the trade-offs, show a concrete side-by-side diff, and ask the user for approval. Ask before any install step.
 3. **The Safe Execution Invariant (Never Boot the App):**
    * **STRICTLY PROHIBITED:** Starting the user's web server, background workers, databases, or live application entrypoints.
    * **MANDATORY:** Verification is strictly limited to isolated unit test commands explicitly specified by the user (e.g. `pytest`, `npm test`, `cargo test`) and re-running `determify <path> --fail-on-findings`.
 
 ---
 
-## 🚀 Phase 1: Tool Verification & Setup (Zero User Burden)
+## 📟 Exit-Code Contract
 
-When the user asks you to audit or optimize their project, verify and provision `determify` in the environment quietly:
+Always inspect Determify's exit code before reporting anything to the user:
 
-```bash
-# 1. Check if determify is already available
-command -v determify >/dev/null 2>&1 || python3 -m determify.cli --version >/dev/null 2>&1
-```
-
-If not found, provision it automatically using the available environment mechanism:
-```bash
-# Option A: Fast execution via pipx / uv (if installed)
-pipx run determify --version >/dev/null 2>&1
-
-# Option B: Install via pip from GitHub into the current environment or user site
-python3 -m pip install --quiet git+https://github.com/rodericklm1/determify.git
-
-# Option C: Running from local repository checkout (if auditing determify itself)
-python3 -m determify.cli --version
-```
-
-Verify that the CLI runs and produces version output before proceeding. Do not ask the user to run setup commands unless permissions explicitly block you.
+| Exit code | Meaning | Required Agent Behavior |
+| :--- | :--- | :--- |
+| `0` | Scan completed successfully; no findings (or clean under `--fail-on-findings`). | Report clean status, including any skipped files. |
+| `1` | Actionable findings present (when using `--fail-on-findings`). | Proceed to Phase 3 collaborative triage. |
+| `2` | Operational failure: missing target path, unreadable target, or decision engine error. stdout is empty. | Report the stderr error as an operational failure. **Never report an exit-2 run as clean.** |
 
 ---
 
-## 🔍 Phase 2: Deterministic Inspection & Interpretation
+## 🚀 Phase 1: Tool Verification & Pinned Setup
+
+When the user asks you to audit or optimize their project, verify that `determify` is available:
+
+```bash
+command -v determify >/dev/null 2>&1 && determify -v
+```
+
+If not found, **stop and ask the user** before installing. State exactly what will be installed and from where, then offer:
+
+```bash
+# Option A: Pinned install from the tagged release (recommended)
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.2
+
+# Option B: Running from a local repository checkout (if auditing determify itself)
+python3 -m determify.cli -v
+```
+
+### Installation Rules:
+* **Always pin the tag.** Never install from an unpinned `main` branch.
+* If the package appears on PyPI in the future, prefer `pip install determify==<version>`. Note that `pipx run determify` requires a published PyPI release.
+* After install, run `determify -v`, report the version to the user, and record it alongside all findings.
+* **Version Floor Check:** If the reported version is below `0.1.2`, recommend upgrading before interpreting results: fail-closed exit semantics, per-file safety caps, and provider honesty landed in that release.
+
+---
+
+## 🔍 Phase 2: Deterministic Inspection & Bounded Interpretation
 
 ### 1. Execute the Scan
 Run the scan against the target path (defaulting to the current repository root `.`):
@@ -74,40 +93,47 @@ Run the scan against the target path (defaulting to the current repository root 
 determify . --json
 ```
 
-*Tip: If the codebase is large (>50MB), `determify` automatically batches by byte-budget and streams progress to stderr without dropping findings.*
+### 2. Large-Tree Context Defense & Bounded Output
+On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON. If output might be large, inspect the summary headers and sample findings first:
 
-### 2. Interpret the Findings
-Parse the structured JSON output:
-```json
-{
-  "version": "0.1.2",
-  "scanned_files": 48,
-  "skipped": 0,
-  "total_findings": 3,
-  "findings": [...]
-}
+```bash
+determify . --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f[\"id\"]}] {f[\"file\"]}:{f[\"line\"]} -> {f[\"name\"]}') for f in d.get('findings',[])[:15]]"
 ```
 
-Synthesize the results into an **Executive Briefing**:
-* **Scan Scope:** Number of files scanned and total anti-patterns detected.
+**Large Tree Handling:** Determify automatically batches by byte-budget (50MB per batch). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume—a terminated scan must be re-run from the start.
+
+### 3. Optional Deep Semantic Inspection (`--deep`)
+If the user specifically asks for deep or semantic triage:
+* `--deep` sends 60-line code chunks to an external endpoint and **strictly requires an explicit provider flag** (`--kev` for local or `--jev` for cloud) to prevent accidental source code exfiltration.
+* Ensure local Kev (`http://localhost:8009/v1/systemone`) or `OPENROUTER_API_KEY` is configured before running:
+  ```bash
+  determify . --deep --kev --json
+  ```
+
+### 4. Synthesize the Executive Briefing
+Synthesize the structured findings for the user:
+* **Scan Scope:** Files scanned, files skipped, and total anti-patterns detected. If `skipped > 0`, report the causes (stderr `[skip]` lines detail symlinks, oversize, or unreadable files). A scan where files were skipped is not a full clean bill of health.
 * **Tier Distribution:**
-  * How many call sites can be completely eliminated into **Tier 0** stdlib code ($0.00, 0ms).
-  * How many call sites should be routed to a **Tier 0.5** decision gate (Jev/Kev).
+  * How many call sites can be eliminated into **Tier 0** stdlib code ($0.00, 0ms).
+  * How many call sites would benefit from a user-operated **Tier 0.5** decision gate.
   * How many call sites are legitimately frontier tasks.
-* **Estimated Impact:** Quantify approximate latency savings (e.g. replacing three 2,500ms API roundtrips saves ~7.5 seconds per execution cycle).
+* **Estimated Impact:** Quantify approximate latency savings, labeled clearly as estimates (e.g. replacing three 2,500ms API roundtrips saves roughly 7.5 seconds per execution cycle, if that latency holds in this codebase).
+* **Precision Caveat:** Findings are lexical candidate matches, not absolute verdicts. A clean scan confirms no documented DET-01–07 rule matched; it is not a formal proof of absence.
 
 ---
 
 ## 🤝 Phase 3: Collaborative Refactoring Protocol
 
-Walk through the findings with the user. Treat the user as the domain expert:
+### Context Defense on Multi-File Findings:
+* **If Total Findings $\le$ 5:** Walk through findings individually using the Detailed Presentation Block below.
+* **If Total Findings > 5:** Present a high-level summary table grouped by Rule ID (`DET-01` to `DET-07`) and file counts. Ask the user which category or high-priority file to tackle first, then proceed in manageable batches.
 
 ### Standard Finding Presentation Block
 ```markdown
 ### 🔍 Finding: [DET-01] Date / Time Math via LLM
 - **Call site:** `src/agent/prompts.py:42`
 - **Current Pattern:** Prompting an LLM: *"What is today's date and day of week?"*
-- **The Problem:** Incurs ~2,500ms network latency and ~150 prompt tokens on every request.
+- **The Problem:** Adds network latency (~2,500ms) and prompt tokens on every request.
 - **Recommended Tier 0 Replacement:** Use Python's native `datetime.now(timezone.utc)`.
 - **Proposed Diff:**
 ```diff
@@ -128,7 +154,7 @@ Walk through the findings with the user. Treat the user as the domain expert:
 
 ## 📖 Rule Remediation Playbook
 
-Use these battle-tested deterministic patterns when collaborating on fixes:
+Use these deterministic patterns when collaborating on fixes:
 
 ### DET-01: Date / Time Math via LLM
 * **Anti-Pattern:** Asking an LLM for today's date, relative time offsets, or timestamp conversions.
@@ -175,7 +201,7 @@ Use these battle-tested deterministic patterns when collaborating on fixes:
 * **Anti-Pattern:** Invoking expensive frontier models (`client.chat.completions`, `client.messages.create`, `ChatOpenAI`, `opencode run`, `hermes run`) without a pre-flight heuristic.
 * **Remediation Collaboration:**
   1. *Can a deterministic check answer this?* If the prompt handles a known static dictionary, regex, or cache hit, intercept it before the API call.
-  2. *Is it a classification, boolean check, or routing task?* Propose routing to a **Tier 0.5 decision model** (TypeSafe Jev or on-prem Kev-0.6B) for <100ms latency and $0.000042 cost.
+  2. *Is it a classification, boolean check, or routing task?* Propose a deterministic or cached pre-flight gate. Only discuss routing to a dedicated decision service if the user already operates one—Determify does not ship such a service.
   3. *Is it open-ended generation?* Keep the generative frontier model.
 
 ---
@@ -186,8 +212,12 @@ Use these battle-tested deterministic patterns when collaborating on fixes:
   * **Rebuttal:** **STRICTLY PROHIBITED.** The user must review each change. Refactoring prompt logic alters control flow, return types, and data contracts. Always propose, explain the trade-offs, and wait for confirmation.
 * **Shortcut:** *"I will boot the user's web app or docker-compose to test the fix."*
   * **Rebuttal:** **STRICTLY PROHIBITED.** Never run live application processes or servers. Ask the user how they run their unit test suite.
+* **Shortcut:** *"The tool isn't installed, so I'll pip install it quickly and keep going without asking."*
+  * **Rebuttal:** **STRICTLY PROHIBITED.** State the source and version tag and get consent first. An install is a supply-chain action on the user's machine.
+* **Shortcut:** *"Installing from an unpinned git main branch."*
+  * **Rebuttal:** Always install from a tagged release (e.g. `@v0.1.2`) to guarantee reproducible, vetted behavior.
 * **Shortcut:** *"An LLM handles edge cases better than regex or stdlib functions."*
-  * **Rebuttal:** LLMs introduce non-determinism, timeout risks, latency cliffs (2–5s), and token costs. A unit test with a regex or stdlib function executes in 0ms with 100% predictability. If edge cases exist, write tests for them.
+  * **Rebuttal:** LLMs introduce non-determinism, timeout risks, latency cliffs, and token costs. A unit test with a regex or stdlib function executes with 100% predictability. If edge cases exist, write tests for them.
 
 ---
 
@@ -200,12 +230,12 @@ Use these battle-tested deterministic patterns when collaborating on fixes:
    ```bash
    determify . --fail-on-findings
    ```
-   *Exit code must be `0`.*
+   *Exit code must be `0`. An exit code of `2` is an operational failure—report the stderr message; do not claim verification. A clean run confirms no documented DET-01–07 rule matched; it is not a proof of absence.*
 3. **Present Savings Ledger:**
    ```markdown
    ## 🏆 Determify Optimization Summary
    - **Call Sites Remediated:** 3
-   - **Estimated Latency Saved:** ~6,500ms per workflow run
-   - **Token Burn Eliminated:** ~450 prompt tokens per cycle ($0.00 runtime cost)
-   - **Verification Status:** Clean (determify exit code 0)
+   - **Estimated Latency Saved:** measured per call site, summed (e.g. ~6,500ms)
+   - **Token Burn Eliminated:** measured per call site, summed (e.g. ~450 prompt tokens)
+   - **Verification Status:** Clean (determify exit code 0, N files scanned, M skipped)
    ```
