@@ -621,5 +621,26 @@ class TestDetermifyScanner(unittest.TestCase):
             self.assertNotIn(str(Path.home()), res.stdout)
             self.assertNotIn(outside, res.stdout)
 
+    def test_extensionless_executable_with_shebang_is_scanned(self):
+        """Verifies that an executable script without a file extension (e.g. CLI bin) is scanned."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "custom-runner"
+            target.write_text('#!/bin/bash\nopenai.chat.completions.create(model="gpt-4", messages=[])\n')
+            target.chmod(0o755)
+            scanned, findings, stats = scan_targets([td], progress=False)
+            self.assertEqual(len(findings), 1)
+            self.assertIn("custom-runner", findings[0]["file"])
+            self.assertEqual(scanned, 1)
+
+    def test_extensionless_non_executable_is_skipped(self):
+        """Verifies that extensionless data/text files without executable bit are skipped."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "random-doc"
+            target.write_text('Some plain text without executable bit\n')
+            target.chmod(0o644)
+            scanned, findings, stats = scan_targets([td], progress=False)
+            self.assertEqual(len(findings), 0)
+            self.assertEqual(scanned, 0)
+
 if __name__ == "__main__":
     unittest.main()

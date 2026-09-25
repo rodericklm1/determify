@@ -159,9 +159,23 @@ def _iter_target_files(targets):
             for root, dirs, files in os.walk(str(p), followlinks=False):
                 dirs[:] = [sub for sub in dirs if sub not in IGNORED_DIRS]
                 for fname in files:
-                    if Path(fname).suffix.lower() not in SUPPORTED_EXTENSIONS:
-                        continue
+                    ext = Path(fname).suffix.lower()
+                    is_candidate = ext in SUPPORTED_EXTENSIONS
                     fpath = os.path.join(root, fname)
+
+                    if not is_candidate and not ext:
+                        # Extensionless executable script detection (e.g. ~/.opencode/bin/obs-densify)
+                        try:
+                            st = os.stat(fpath)
+                            if (st.st_mode & 0o111) and st.st_size > 0:
+                                with open(fpath, "rb") as test_f:
+                                    if test_f.read(2) == b"#!":
+                                        is_candidate = True
+                        except (OSError, PermissionError):
+                            pass
+
+                    if not is_candidate:
+                        continue
                     try:
                         yield fpath, os.stat(fpath).st_size
                     except OSError:
