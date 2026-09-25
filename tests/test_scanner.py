@@ -642,5 +642,28 @@ class TestDetermifyScanner(unittest.TestCase):
             self.assertEqual(len(findings), 0)
             self.assertEqual(scanned, 0)
 
+    def test_allow_marker_exempts_next_code_line_and_does_not_hide_other_ids(self):
+        """A comment marker exempts the next code line for that ID only, and is reported."""
+        from determify.scanner import EXEMPTIONS
+        content = (
+            "#!/bin/bash\n"
+            "# determify:allow DET-07 Gated generative enrichment workflow\n"
+            "exec opencode run --agent librarian \"enrich\"\n"
+            "prompt = \"What is today's date? Please generate the full breakdown.\"\n"
+            "client.messages.create(model=\"claude\", messages=[{\"role\": \"user\", \"content\": prompt}])\n"
+        )
+        EXEMPTIONS.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        det07 = [x for x in findings if x["id"] == "DET-07"]
+        self.assertFalse(any(x["line"] == 3 for x in det07), det07)
+        self.assertTrue(det07, "a DET-07 marker must not hide a different line")
+        self.assertTrue(any(e["id"] == "DET-07" and e["line"] == 3 and "Gated generative" in e["reason"] for e in EXEMPTIONS))
+        # DET-01 on a later line is not covered by a DET-07 marker.
+        self.assertIn("DET-01", [x["id"] for x in findings])
+
 if __name__ == "__main__":
     unittest.main()

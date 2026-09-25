@@ -6,7 +6,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from .scanner import scan_targets
+from .scanner import scan_targets, EXEMPTIONS
 from .jev_evaluator import get_kev_url, OPENROUTER_DECISIONS_URL, get_api_key
 from . import __version__
 
@@ -112,7 +112,8 @@ def _run_cli():
             "scanned_files": scanned_files,
             "skipped": stats["skipped"],
             "total_findings": len(all_findings),
-            "findings": all_findings
+            "findings": all_findings,
+            "exempted": list(EXEMPTIONS),
         }
         print(json.dumps(result, indent=2))
         if args.fail_on_findings and all_findings:
@@ -147,8 +148,17 @@ def _run_cli():
         print("======================================================================")
         return
 
+    if EXEMPTIONS:
+        print(f"[exempt] {len(EXEMPTIONS)} finding(s) suppressed by in-file '# determify:allow' markers:")
+        for e in EXEMPTIONS:
+            print(f"  [exempt] {e['file']}:{e['line']} {e['id']} {e['reason']}")
+        print()
+
     if not all_findings:
-        print("✅ Clean: Zero anti-patterns detected! All scanned code adheres to Tier 0 determinism.")
+        if EXEMPTIONS:
+            print(f"✅ Clean: 0 unreviewed anti-patterns ({len(EXEMPTIONS)} documented exemption(s) listed above).")
+        else:
+            print("✅ Clean: Zero anti-patterns detected! All scanned code adheres to Tier 0 determinism.")
         print("======================================================================")
         return
 

@@ -4,6 +4,7 @@ Secure file reading, symlink safety, size bounds, and zero-allocation regex eval
 """
 
 import os
+import re
 import sys
 import stat
 import errno
@@ -67,6 +68,43 @@ def read_source_file_safe(file_path: str, stats: dict = None) -> str:
             except Exception:
                 pass
 
+# Suppression marker: `# determify:allow <ID> <reason>`, honoured by scan_file().
+# A marker on a code line exempts that line. A marker on its own comment line
+# exempts the next non-blank, non-comment code line. Exemption is reported, never silent.
+ALLOW_MARKER_RE = re.compile(r"determify:allow\s+(DET-\d+|DET-DEEP)\b[ \t]*(.*)", re.IGNORECASE)
+EXEMPTIONS = []
+
+
+def parse_allow_markers(lines):
+    """Return {line_number: {finding_id: reason}} for all determify:allow markers."""
+    allowed = {}
+    for idx, line in enumerate(lines, 1):
+        match = ALLOW_MARKER_RE.search(line)
+        if not match:
+            continue
+        finding_id = match.group(1).upper()
+        reason = match.group(2).strip() or "no reason given"
+        stripped = line.strip()
+        target = idx
+        if stripped.startswith("#") or stripped.startswith("//"):
+            for next_idx in range(idx, len(lines)):
+                candidate = lines[next_idx].strip()
+                if candidate and not candidate.startswith("#") and not candidate.startswith("//"):
+                    target = next_idx + 1
+                    break
+        allowed.setdefault(target, {})[finding_id] = reason
+    return allowed
+
+
+def _record_exemption(file_path, line_no, finding_id, reason):
+    EXEMPTIONS.append({
+        "file": file_path,
+        "line": line_no,
+        "id": finding_id,
+        "reason": reason,
+    })
+
+
 def scan_file(file_path: str, content: str = None):
     """
     Lexical and pattern scan on a single source file.
@@ -89,6 +127,7 @@ def scan_file(file_path: str, content: str = None):
         return findings
 
     lines = content.splitlines()
+    allowed = parse_allow_markers(lines) if "determify:allow" in content else {}
 
     # DET-07: Direct SDK / CLI invocation inspection
     det07 = next((p for p in PATTERNS if p["id"] == "DET-07"), None)
@@ -98,6 +137,10 @@ def scan_file(file_path: str, content: str = None):
             if stripped.startswith(("#", "//", "/*", "*")):
                 continue
             if det07["regex"].search(line):
+                reason = allowed.get(idx, {}).get(det07["id"])
+                if reason:
+                    _record_exemption(file_path, idx, det07["id"], reason)
+                    continue
                 key = (file_path, idx, det07["id"])
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -122,6 +165,10 @@ def scan_file(file_path: str, content: str = None):
             if p["id"] == "DET-07":
                 continue
             if p["regex"].search(line):
+                reason = allowed.get(line_idx, {}).get(p["id"])
+                if reason:
+                    _record_exemption(file_path, line_idx, p["id"], reason)
+                    continue
                 key = (file_path, line_idx, p["id"])
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -246,6 +293,7 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
     if batch_bytes is None or batch_bytes < MIN_BATCH_BYTES:
         batch_bytes = MIN_BATCH_BYTES
 
+    EXEMPTIONS.clear()
     all_findings = []
     scanned_files = 0
     stats = {"skipped": 0, "invoked": False}
