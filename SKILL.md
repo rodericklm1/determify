@@ -70,7 +70,7 @@ If not found, **stop and ask the user** before installing. State exactly what wi
 
 ```bash
 # Option A: Pinned install from the tagged release (recommended)
-python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.2
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.3
 
 # Option B: Running from a local repository checkout (if auditing determify itself)
 python3 -m determify.cli -v
@@ -80,7 +80,7 @@ python3 -m determify.cli -v
 * **Always pin the tag.** Never install from an unpinned `main` branch.
 * If the package appears on PyPI in the future, prefer `pip install determify==<version>`. Note that `pipx run determify` requires a published PyPI release.
 * After install, run `determify -v`, report the version to the user, and record it alongside all findings.
-* **Version Floor Check:** If the reported version is below `0.1.2`, recommend upgrading before interpreting results: fail-closed exit semantics, per-file safety caps, and provider honesty landed in that release.
+* **Version Floor Check:** If the reported version is below `0.1.3`, recommend upgrading before interpreting results: extensionless executable scanning, fail-closed exit semantics, per-file safety caps, and provider honesty landed in recent releases.
 
 ---
 
@@ -218,7 +218,7 @@ Use these deterministic patterns when collaborating on fixes:
 * **Shortcut:** *"The tool isn't installed, so I'll pip install it quickly and keep going without asking."*
   * **Rebuttal:** **STRICTLY PROHIBITED.** State the source and version tag and get consent first. An install is a supply-chain action on the user's machine.
 * **Shortcut:** *"Installing from an unpinned git main branch."*
-  * **Rebuttal:** Always install from a tagged release (e.g. `@v0.1.2`) to guarantee reproducible, vetted behavior.
+  * **Rebuttal:** Always install from a tagged release (e.g. `@v0.1.3`) to guarantee reproducible, vetted behavior.
 * **Shortcut:** *"An LLM handles edge cases better than regex or stdlib functions."*
   * **Rebuttal:** LLMs introduce non-determinism, timeout risks, latency cliffs, and token costs. A unit test with a regex or stdlib function executes with 100% predictability. If edge cases exist, write tests for them.
 
