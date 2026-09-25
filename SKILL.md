@@ -4,7 +4,7 @@ description: "Set up (with user consent) and execute the Determify CLI to audit 
 license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
-  version: "0.1.3"
+  version: "0.1.4"
   repository: "https://github.com/rodericklm1/determify"
 ---
 
@@ -70,7 +70,7 @@ If not found, **stop and ask the user** before installing. State exactly what wi
 
 ```bash
 # Option A: Pinned install from the tagged release (recommended)
-python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.3
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.4
 
 # Option B: Running from a local repository checkout (if auditing determify itself)
 python3 -m determify.cli -v
@@ -80,7 +80,7 @@ python3 -m determify.cli -v
 * **Always pin the tag.** Never install from an unpinned `main` branch.
 * If the package appears on PyPI in the future, prefer `pip install determify==<version>`. Note that `pipx run determify` requires a published PyPI release.
 * After install, run `determify -v`, report the version to the user, and record it alongside all findings.
-* **Version Floor Check:** If the reported version is below `0.1.3`, recommend upgrading before interpreting results: extensionless executable scanning, fail-closed exit semantics, per-file safety caps, and provider honesty landed in recent releases.
+* **Version Floor Check:** If the reported version is below `0.1.4`, recommend upgrading before interpreting results: multi-provider Jev support (TypeSafe official, OpenRouter, custom base URLs), extensionless executable scanning, fail-closed exit semantics, and provider honesty landed in recent releases.
 
 ---
 
@@ -104,14 +104,14 @@ determify . --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(
 
 ### 3. Optional Deep Semantic Inspection (`--deep`)
 If the user specifically asks for deep or semantic triage:
-* `--deep` sends 60-line source code chunks to an external decision engine and **strictly requires an explicit provider flag** (`--kev` for local or `--jev` for cloud) to prevent accidental transmission of source code.
+* `--deep` sends 60-line source code chunks to an external decision engine and **strictly requires an explicit provider flag** (`--kev` for local or `--jev` for cloud/custom) to prevent accidental transmission of source code.
 * **Local Kev (`--kev`):** Runs air-gapped on localhost with zero data leaving the host. Ensure your local Kev endpoint (defaulting to `http://localhost:8009/v1/systemone` or `$KEV_ENDPOINT`) is running before executing:
   ```bash
   determify . --deep --kev --json
   ```
-* **Cloud Jev (`--jev` Consent Gate):** **MANDATORY PERMISSION REQUIRED.** Running `--deep --jev` transmits 60-line source code chunks over HTTPS to OpenRouter's cloud decisions endpoint. Before running this command, you **must plainly state** that source code chunks will leave the machine and obtain explicit user authorization:
-  > *"Running `--deep --jev` will transmit 60-line source code chunks to OpenRouter's cloud decisions API (`https://openrouter.ai/api/alpha/decisions`). Do you authorize sending code from this repository to the cloud for semantic triage?"*
-  Only proceed with `determify . --deep --jev --json` after receiving explicit consent and ensuring `OPENROUTER_API_KEY` is set.
+* **Cloud / Remote Jev (`--jev` Consent Gate):** **MANDATORY PERMISSION REQUIRED.** Running `--deep --jev` transmits 60-line source code chunks over HTTPS to the configured Jev decision endpoint (TypeSafe official `https://api.typesafe.ai/v1/systemone`, OpenRouter `https://openrouter.ai/api/alpha/decisions`, or custom `--base-url`). Before running this command, you **must plainly state** the target destination and obtain explicit user authorization:
+  > *"Running `--deep --jev` will transmit 60-line source code chunks to the Jev decision endpoint (`<resolved_endpoint>`). Do you authorize sending code from this repository for semantic triage?"*
+  Only proceed with `determify . --deep --jev --json` after receiving explicit consent and ensuring an API key is set (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, `JEV_API_KEY`, or `--api-key`).
 
 ### 4. Synthesize the Executive Briefing
 Synthesize the structured findings for the user:
@@ -218,7 +218,7 @@ Use these deterministic patterns when collaborating on fixes:
 * **Shortcut:** *"The tool isn't installed, so I'll pip install it quickly and keep going without asking."*
   * **Rebuttal:** **STRICTLY PROHIBITED.** State the source and version tag and get consent first. An install is a supply-chain action on the user's machine.
 * **Shortcut:** *"Installing from an unpinned git main branch."*
-  * **Rebuttal:** Always install from a tagged release (e.g. `@v0.1.3`) to guarantee reproducible, vetted behavior.
+  * **Rebuttal:** Always install from a tagged release (e.g. `@v0.1.4`) to guarantee reproducible, vetted behavior.
 * **Shortcut:** *"An LLM handles edge cases better than regex or stdlib functions."*
   * **Rebuttal:** LLMs introduce non-determinism, timeout risks, latency cliffs, and token costs. A unit test with a regex or stdlib function executes with 100% predictability. If edge cases exist, write tests for them.
 

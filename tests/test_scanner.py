@@ -13,7 +13,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 from determify.scanner import scan_file, scan_targets, read_source_file_safe
-from determify.jev_evaluator import _post_json, get_api_key
+from determify.jev_evaluator import _post_json, get_api_key, resolve_decision_config, DEFAULT_TYPESAFE_URL, OPENROUTER_DECISIONS_URL
 from determify.patterns import PATTERNS, MAX_GAP, _cue
 
 class TestDetermifyScanner(unittest.TestCase):
@@ -407,7 +407,10 @@ class TestDetermifyScanner(unittest.TestCase):
         cmd = [sys.executable, "-m", "determify.cli", *args]
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).parent.parent)
-        env.pop("OPENROUTER_API_KEY", None)
+        for k in ("OPENROUTER_API_KEY", "JEV_API_KEY", "TYPESAFE_API_KEY",
+                  "JEV_BASE_URL", "JEV_ENDPOINT", "TYPESAFE_BASE_URL",
+                  "OPENROUTER_DECISIONS_URL", "JEV_MODEL"):
+            env.pop(k, None)
         if extra_env:
             env.update(extra_env)
         return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20, cwd=cwd)
@@ -664,6 +667,140 @@ class TestDetermifyScanner(unittest.TestCase):
         self.assertTrue(any(e["id"] == "DET-07" and e["line"] == 3 and "Gated generative" in e["reason"] for e in EXEMPTIONS))
         # DET-01 on a later line is not covered by a DET-07 marker.
         self.assertIn("DET-01", [x["id"] for x in findings])
+
+    def test_resolve_decision_config_typesafe_key(self):
+        """Verifies TYPESAFE_API_KEY defaults base_url to TypeSafe official and model to jev-latest."""
+        old_ts = os.environ.get("TYPESAFE_API_KEY")
+        old_or = os.environ.get("OPENROUTER_API_KEY")
+        old_jev = os.environ.get("JEV_API_KEY")
+        try:
+            for k in ("TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "JEV_API_KEY"):
+                os.environ.pop(k, None)
+            os.environ["TYPESAFE_API_KEY"] = "ts-test-secret"
+            cfg = resolve_decision_config()
+            self.assertEqual(cfg["api_key"], "ts-test-secret")
+            self.assertEqual(cfg["base_url"], DEFAULT_TYPESAFE_URL)
+            self.assertEqual(cfg["model"], "jev-latest")
+        finally:
+            os.environ.pop("TYPESAFE_API_KEY", None)
+            if old_ts: os.environ["TYPESAFE_API_KEY"] = old_ts
+            if old_or: os.environ["OPENROUTER_API_KEY"] = old_or
+            if old_jev: os.environ["JEV_API_KEY"] = old_jev
+
+    def test_resolve_decision_config_openrouter_key(self):
+        """Verifies OPENROUTER_API_KEY defaults base_url to OpenRouter and model to ~typesafe/jev-latest."""
+        old_ts = os.environ.get("TYPESAFE_API_KEY")
+        old_or = os.environ.get("OPENROUTER_API_KEY")
+        old_jev = os.environ.get("JEV_API_KEY")
+        try:
+            for k in ("TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "JEV_API_KEY"):
+                os.environ.pop(k, None)
+            os.environ["OPENROUTER_API_KEY"] = "sk-or-test-secret"
+            cfg = resolve_decision_config()
+            self.assertEqual(cfg["api_key"], "sk-or-test-secret")
+            self.assertEqual(cfg["base_url"], OPENROUTER_DECISIONS_URL)
+            self.assertEqual(cfg["model"], "~typesafe/jev-latest")
+        finally:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            if old_ts: os.environ["TYPESAFE_API_KEY"] = old_ts
+            if old_or: os.environ["OPENROUTER_API_KEY"] = old_or
+            if old_jev: os.environ["JEV_API_KEY"] = old_jev
+
+    def test_resolve_decision_config_cli_overrides(self):
+        """Verifies that explicit CLI flags override environment variables."""
+        cfg = resolve_decision_config(
+            base_url="https://custom.internal.ai/v1/systemone",
+            api_key="cli-secret-key",
+            model="custom-jev-model"
+        )
+        self.assertEqual(cfg["base_url"], "https://custom.internal.ai/v1/systemone")
+        self.assertEqual(cfg["api_key"], "cli-secret-key")
+        self.assertEqual(cfg["model"], "custom-jev-model")
+
+    def test_resolve_decision_config_env_file_typesafe(self):
+        """Verifies reading TYPESAFE_API_KEY and JEV_BASE_URL from an explicit .env file."""
+        with tempfile.TemporaryDirectory() as td:
+            env_path = Path(td) / ".env.custom"
+            env_path.write_text("TYPESAFE_API_KEY=ts-from-file\nJEV_BASE_URL=https://proxy.example.com/systemone\n")
+            cfg = resolve_decision_config(env_file=str(env_path))
+            self.assertEqual(cfg["api_key"], "ts-from-file")
+            self.assertEqual(cfg["base_url"], "https://proxy.example.com/systemone")
+            self.assertEqual(cfg["model"], "jev-latest")
+
+    def test_cli_missing_key_error_is_provider_agnostic(self):
+        """Verifies that running --jev without any key provides an informative, provider-agnostic error."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "dummy.py").write_text("x = 1\n")
+            res = self._cli(["--jev", td])
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("No Jev API key found", res.stderr)
+            self.assertIn("JEV_API_KEY", res.stderr)
+            self.assertIn("TYPESAFE_API_KEY", res.stderr)
+            self.assertIn("OPENROUTER_API_KEY", res.stderr)
+
+    def test_cli_custom_base_url_and_api_key_invoked(self):
+        """Verifies that --base-url and --api-key properly route request and headers to custom endpoint."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        received = {}
+
+        class CustomHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length).decode("utf-8") if length else ""
+                received["auth"] = self.headers.get("Authorization")
+                received["user_agent"] = self.headers.get("User-Agent")
+                received["referer"] = self.headers.get("HTTP-Referer")
+                received["body"] = json.loads(body) if body else {}
+
+                resp_payload = {
+                    "model": "jev-latest",
+                    "answers": {
+                        "optimal_tier": {
+                            "choice": "tier_0_deterministic",
+                            "confidence": 0.95
+                        },
+                        "can_be_deterministic": {
+                            "noul": 0.98
+                        },
+                        "actionability_score": {
+                            "score": 2.8
+                        }
+                    }
+                }
+                data = json.dumps(resp_payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CustomHandler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "test_file.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4", messages=[])\n')
+                res = self._cli([
+                    "--base-url", f"http://127.0.0.1:{port}/v1/systemone",
+                    "--api-key", "my-secret-token",
+                    "--no-progress",
+                    str(target)
+                ])
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(received.get("auth"), "Bearer my-secret-token")
+                self.assertEqual(received.get("user_agent"), "determify")
+                self.assertIsNone(received.get("referer"))
+                self.assertIn("Decision Engine Active", res.stdout)
+                self.assertIn(f"http://127.0.0.1:{port}/v1/systemone", res.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 if __name__ == "__main__":
     unittest.main()

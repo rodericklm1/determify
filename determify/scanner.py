@@ -246,7 +246,8 @@ def _batches(files, batch_bytes):
         yield batch
 
 
-def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=False):
+def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=False,
+              base_url=None, api_key=None, model=None):
     """Scans a single file. Returns (counted_bool, findings)."""
     content = read_source_file_safe(fpath, stats)
     if not content:
@@ -257,7 +258,10 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
     if (use_jev or use_kev) and findings:
         for item in findings:
             try:
-                verdict = evaluate_with_jev(item, content, use_kev=use_kev, env_file=env_file)
+                verdict = evaluate_with_jev(
+                    item, content, use_kev=use_kev, env_file=env_file,
+                    base_url=base_url, api_key=api_key, model=model
+                )
             except Exception as e:
                 raise RuntimeError(
                     f"decision engine failed closed for {item.get('file')}:{item.get('line')}: {e}"
@@ -269,7 +273,8 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
     if deep_scan:
         try:
             deep_findings = deep_scan_file(
-                fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug
+                fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug,
+                base_url=base_url, api_key=api_key, model=model
             )
         except Exception as e:
             raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e
@@ -280,7 +285,8 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
 
 
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
-                 batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False):
+                 batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False,
+                 base_url=None, api_key=None, model=None):
     """Scans target paths, partitioned into byte-budgeted batches.
 
     A large tree is split so that progress is observable and a timeout costs one
@@ -311,7 +317,10 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
     for idx, batch in enumerate(batches, start=1):
         batch_found = 0
         for fpath in batch:
-            counted, findings = _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug)
+            counted, findings = _scan_one(
+                fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug,
+                base_url=base_url, api_key=api_key, model=model
+            )
             if counted:
                 scanned_files += 1
             if findings:

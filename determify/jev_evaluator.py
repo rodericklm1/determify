@@ -12,6 +12,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions")
 DEFAULT_KEV_URL = "http://localhost:8009/v1/systemone"
 MAX_RESPONSE_BYTES = 256_000
@@ -77,32 +78,125 @@ def _read_regular_nofollow(path: Path, limit: int = 65_536) -> str:
                 pass
 
 
-def get_api_key(env_file=None):
-    """
-    Resolves OPENROUTER_API_KEY from the environment, or from an explicitly
-    requested .env file. Never reads the implicit cwd .env, does not walk parent
-    directories or $HOME, and does not follow symlinks.
-    """
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if key:
-        return key.strip().strip("\"'")
-
+def _parse_env_file_safely(env_file: str) -> dict:
+    """Reads key-value pairs from an explicit .env file using nofollow read."""
     if not env_file:
-        return None
+        return {}
     text = _read_regular_nofollow(Path(env_file))
     if not text:
-        return None
+        return {}
+    res = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[7:].strip()
-        if line.startswith("OPENROUTER_API_KEY="):
-            val = line.split("=", 1)[1].strip()
-            val = val.split(" #", 1)[0].strip()
-            return val.strip("\"'")
+        if "=" in line:
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().split(" #", 1)[0].strip().strip("\"'")
+            res[k] = v
+    return res
+
+def get_api_key(env_file=None):
+    """
+    Resolves API key (JEV_API_KEY, TYPESAFE_API_KEY, or OPENROUTER_API_KEY)
+    from the environment, or from an explicitly requested .env file.
+    Never reads the implicit cwd .env, does not walk parent
+    directories or $HOME, and does not follow symlinks.
+    """
+    for var in ("JEV_API_KEY", "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip().strip("\"'")
+
+    if not env_file:
+        return None
+
+    file_vars = _parse_env_file_safely(env_file)
+    for var in ("JEV_API_KEY", "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+        val = file_vars.get(var)
+        if val and val.strip():
+            return val.strip().strip("\"'")
     return None
+
+def resolve_decision_config(base_url=None, api_key=None, model=None, env_file=None, use_kev=False):
+    """
+    Resolves the complete configuration for decision engine evaluation:
+    - base_url (TypeSafe official, OpenRouter, local Kev, or custom proxy)
+    - api_key (from CLI, environment, or explicit .env file)
+    - model (e.g. 'jev-latest', '~typesafe/jev-latest', or 'kev-latest')
+    """
+    file_vars = _parse_env_file_safely(env_file) if env_file else {}
+
+    # 1. API Key resolution
+    resolved_key = None
+    key_source = None
+    if api_key and str(api_key).strip():
+        resolved_key = str(api_key).strip().strip("\"'")
+        key_source = "cli"
+    else:
+        for var in ("JEV_API_KEY", "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+            v = os.environ.get(var) or file_vars.get(var)
+            if v and v.strip():
+                resolved_key = v.strip().strip("\"'")
+                key_source = var
+                break
+
+    # 2. Base URL resolution
+    resolved_url = None
+    if use_kev:
+        resolved_url = (
+            base_url
+            or os.environ.get("KEV_ENDPOINT")
+            or file_vars.get("KEV_ENDPOINT")
+            or DEFAULT_KEV_URL
+        )
+    elif base_url and str(base_url).strip():
+        resolved_url = str(base_url).strip()
+    else:
+        for var in ("JEV_BASE_URL", "JEV_ENDPOINT", "TYPESAFE_BASE_URL", "OPENROUTER_DECISIONS_URL"):
+            v = os.environ.get(var) or file_vars.get(var)
+            if v and v.strip():
+                resolved_url = v.strip()
+                break
+        if not resolved_url:
+            if key_source == "OPENROUTER_API_KEY":
+                resolved_url = OPENROUTER_DECISIONS_URL
+            else:
+                resolved_url = DEFAULT_TYPESAFE_URL
+
+    # 3. Model resolution
+    resolved_model = None
+    if use_kev:
+        resolved_model = (
+            model
+            or os.environ.get("KEV_MODEL")
+            or file_vars.get("KEV_MODEL")
+            or "kev-latest"
+        )
+    elif model and str(model).strip():
+        resolved_model = str(model).strip()
+    else:
+        v = os.environ.get("JEV_MODEL") or file_vars.get("JEV_MODEL")
+        if v and v.strip():
+            resolved_model = v.strip()
+        else:
+            parsed = urllib.parse.urlparse(resolved_url)
+            host = (parsed.netloc or "").split(":")[0].lower()
+            if "openrouter.ai" in host:
+                resolved_model = "~typesafe/jev-latest"
+            else:
+                resolved_model = "jev-latest"
+
+    return {
+        "base_url": resolved_url,
+        "api_key": resolved_key,
+        "model": resolved_model,
+        "key_source": key_source,
+        "use_kev": use_kev
+    }
 
 def get_kev_url():
     """Resolves local Kev-0.6B endpoint URL."""
@@ -137,49 +231,84 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 8):
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Malformed JSON response from {url}: {e}") from e
 
-def call_decision_endpoint(payload, use_kev=False, env_file=None):
+def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None, api_key=None, model=None):
     """
-    Executes a decision request against on-prem Kev-0.6B or Cloud Jev.
+    Executes a decision request against on-prem Kev-0.6B or Cloud Jev (TypeSafe, OpenRouter, or custom).
     """
+    cfg = resolve_decision_config(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        env_file=env_file,
+        use_kev=use_kev,
+    )
+
+    if "model" not in payload or payload.get("model") in ("~typesafe/jev-latest", "jev-latest", "kev-latest"):
+        payload["model"] = cfg["model"]
+
     if use_kev:
-        kev_url = get_kev_url()
+        headers = {"Content-Type": "application/json"}
+        if cfg["api_key"]:
+            headers["Authorization"] = f"Bearer {cfg['api_key']}"
         data = _post_json(
-            kev_url,
+            cfg["base_url"],
             payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=5
         )
         if not isinstance(data, dict):
             raise RuntimeError(f"Unexpected response type from Kev ({type(data).__name__})")
         return data, "kev-0.6b (local)"
 
-    api_key = get_api_key(env_file=env_file)
-    if not api_key:
+    if not cfg["api_key"]:
         raise ValueError(
-            "OPENROUTER_API_KEY not found in environment.\n"
-            "To use cloud Jev triage, export OPENROUTER_API_KEY or pass --env-file, or use --kev for on-prem triage."
+            "No Jev API key found in environment or arguments.\n"
+            "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
+            "To use on-prem triage without an API key, use --kev."
         )
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/rodericklm1/determify",
-        "X-Title": "Determify Decision Engine"
     }
+    parsed = urllib.parse.urlparse(cfg["base_url"])
+    host = (parsed.netloc or "").split(":")[0].lower()
+    if "openrouter.ai" in host:
+        headers["HTTP-Referer"] = "https://github.com/rodericklm1/determify"
+        headers["X-Title"] = "Determify Decision Engine"
+    else:
+        headers["User-Agent"] = "determify"
+
     data = _post_json(
-        OPENROUTER_DECISIONS_URL,
+        cfg["base_url"],
         payload,
         headers=headers,
         timeout=8
     )
     if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected response type from OpenRouter ({type(data).__name__})")
-    return data, "jev-latest (cloud)"
+        raise RuntimeError(f"Unexpected response type from decision endpoint ({type(data).__name__})")
 
-def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None):
+    if "openrouter.ai" in host:
+        provider_name = f"{cfg['model']} (openrouter.ai)"
+    elif "typesafe.ai" in host:
+        provider_name = f"{cfg['model']} (typesafe.ai)"
+    else:
+        provider_name = f"{cfg['model']} ({host or 'custom'})"
+
+    return data, provider_name
+
+def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_url=None, api_key=None, model=None):
     """
     Evaluates an identified code finding using Jev or Kev to determine optimal tier.
     """
+    cfg = resolve_decision_config(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        env_file=env_file,
+        use_kev=use_kev,
+    )
+
     lines = file_content.splitlines()
     line_idx = max(0, finding.get("line", 1) - 1)
     start_idx = max(0, line_idx - 15)
@@ -194,7 +323,7 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None):
     )
 
     payload = {
-        "model": "kev-latest" if use_kev else "~typesafe/jev-latest",
+        "model": cfg["model"],
         "state": state,
         "questions": {
             "optimal_tier": {
@@ -223,7 +352,20 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None):
     }
 
     t0 = time.time()
-    data, provider_name = call_decision_endpoint(payload, use_kev=use_kev, env_file=env_file)
+    extra_kwargs = {}
+    if base_url is not None:
+        extra_kwargs["base_url"] = base_url
+    if api_key is not None:
+        extra_kwargs["api_key"] = api_key
+    if model is not None:
+        extra_kwargs["model"] = model
+
+    data, provider_name = call_decision_endpoint(
+        payload,
+        use_kev=use_kev,
+        env_file=env_file,
+        **extra_kwargs
+    )
     lat_ms = round((time.time() - t0) * 1000, 1)
 
     ans = data.get("answers", {}) if isinstance(data, dict) else {}

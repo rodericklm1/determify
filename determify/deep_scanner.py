@@ -5,11 +5,12 @@ Scans functions and script blocks using Jev or Kev to find unflagged, implicit L
 
 import sys
 import time
-from .jev_evaluator import call_decision_endpoint
+from .jev_evaluator import call_decision_endpoint, resolve_decision_config
 
 SIGNAL_WORDS = ["prompt", "completion", "model", "llm", "invoke", "messages", "client"]
 
-def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=None, debug=False):
+def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=None, debug=False,
+                   base_url=None, api_key=None, model=None):
     """
     Chunked semantic scan across files containing LLM signals.
     Requires an explicit decision provider (Jev or Kev).
@@ -30,6 +31,14 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
     content_lower = file_content.lower()
     if not any(sig in content_lower for sig in llm_signals):
         return []
+
+    cfg = resolve_decision_config(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        env_file=env_file,
+        use_kev=use_kev,
+    )
 
     reported_spans = set()
     i = 0
@@ -59,7 +68,7 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
         )
 
         payload = {
-            "model": "kev-latest" if use_kev else "~typesafe/jev-latest",
+            "model": cfg["model"],
             "state": state,
             "questions": {
                 "contains_unnecessary_ai": {
@@ -79,7 +88,20 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
         }
 
         t0 = time.time()
-        data, provider_name = call_decision_endpoint(payload, use_kev=use_kev, env_file=env_file)
+        extra_kwargs = {}
+        if base_url is not None:
+            extra_kwargs["base_url"] = base_url
+        if api_key is not None:
+            extra_kwargs["api_key"] = api_key
+        if model is not None:
+            extra_kwargs["model"] = model
+
+        data, provider_name = call_decision_endpoint(
+            payload,
+            use_kev=use_kev,
+            env_file=env_file,
+            **extra_kwargs
+        )
         lat_ms = round((time.time() - t0) * 1000, 1)
         if stats is not None:
             stats["invoked"] = True

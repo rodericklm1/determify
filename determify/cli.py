@@ -7,7 +7,7 @@ import json
 import argparse
 from pathlib import Path
 from .scanner import scan_targets, EXEMPTIONS
-from .jev_evaluator import get_kev_url, OPENROUTER_DECISIONS_URL, get_api_key
+from .jev_evaluator import resolve_decision_config, get_kev_url, DEFAULT_TYPESAFE_URL, OPENROUTER_DECISIONS_URL, get_api_key
 from . import __version__
 
 def main():
@@ -23,11 +23,14 @@ def _run_cli():
         description="determify: Find where code uses AI when a deterministic script or decision model is better."
     )
     parser.add_argument("path", nargs="*", default=["."], help="Files or directories to scan (default: current directory). Use '--' before paths starting with a dash.")
-    parser.add_argument("--jev", action="store_true", help="Use TypeSafe Jev via Cloud OpenRouter Decisions API for intelligent semantic triage")
+    parser.add_argument("--jev", action="store_true", help="Use TypeSafe Jev (TypeSafe official, OpenRouter, or custom endpoint) for intelligent semantic triage")
     parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for sub-90ms local triage")
+    parser.add_argument("--base-url", "--endpoint", default=None, help="Custom Jev decision API endpoint URL (e.g. 'https://api.typesafe.ai/v1/systemone', 'https://openrouter.ai/api/alpha/decisions', or an internal proxy). Overrides JEV_BASE_URL.")
+    parser.add_argument("--api-key", "--key", default=None, help="API key for Jev decision provider. Overrides JEV_API_KEY, TYPESAFE_API_KEY, and OPENROUTER_API_KEY.")
+    parser.add_argument("--model", default=None, help="Decision model identifier (defaults to 'jev-latest' for TypeSafe/custom or '~typesafe/jev-latest' for OpenRouter).")
     parser.add_argument("--deep", action="store_true", help="Execute deep semantic chunk analysis to detect unflagged AI waste (requires --jev or --kev)")
     parser.add_argument("--deep-debug", action="store_true", help="Log chunks the deep classifier evaluated but dropped to stderr (use with --deep)")
-    parser.add_argument("--env-file", default=None, help="Explicit path to .env file containing OPENROUTER_API_KEY")
+    parser.add_argument("--env-file", default=None, help="Explicit path to .env file containing API key and endpoint configuration")
     parser.add_argument("--batch-mb", type=int, default=None,
                         help="Split large trees into batches of this many MiB, reporting progress to stderr. "
                              "Default 50. Batching never changes the findings, only how much work happens per step.")
@@ -38,10 +41,14 @@ def _run_cli():
 
     args = parser.parse_args()
 
+    # Convenience: passing --base-url or --api-key implies --jev triage unless --kev is requested
+    if (args.base_url or args.api_key or args.model) and not args.kev:
+        args.jev = True
+
     # Safety: --deep requires an explicit provider to prevent accidental source exfiltration
     if args.deep and not (args.jev or args.kev):
         sys.stderr.write(
-            "Error: --deep requires an explicit decision engine flag (--jev for cloud, or --kev for on-prem).\n"
+            "Error: --deep requires an explicit decision engine flag (--jev for cloud/custom, or --kev for on-prem).\n"
             "This prevents accidental transmission of source code chunks to cloud endpoints.\n"
         )
         sys.exit(2)
@@ -53,14 +60,21 @@ def _run_cli():
             sys.stderr.write(f"Error: Target path does not exist: {t}\n")
         sys.exit(2)
 
-    # Pre-flight check for Cloud Jev
+    # Pre-flight check for Cloud / Custom Jev
     if args.jev and not args.kev:
-        key = get_api_key(env_file=args.env_file)
-        if not key:
+        cfg = resolve_decision_config(
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            env_file=args.env_file,
+            use_kev=False,
+        )
+        if not cfg["api_key"]:
             sys.stderr.write(
-                "Error: OPENROUTER_API_KEY not found in environment.\n"
-                "To use Cloud Jev triage, export OPENROUTER_API_KEY or specify --env-file.\n"
+                "Error: No Jev API key found in environment or arguments.\n"
+                "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
                 "To use on-prem triage without an API key, use --kev.\n"
+                "Optional custom endpoint: --base-url or JEV_BASE_URL.\n"
             )
             sys.exit(2)
 
@@ -73,7 +87,10 @@ def _run_cli():
             env_file=args.env_file,
             batch_bytes=(args.batch_mb * 1_048_576) if args.batch_mb else None,
             progress=not args.no_progress,
-            deep_debug=args.deep_debug
+            deep_debug=args.deep_debug,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
         )
     except Exception as e:
         # Fail closed: stderr + exit 2, and do not print a clean or success report.
@@ -84,8 +101,16 @@ def _run_cli():
 
     # Destination banner only after a provider call actually returned.
     if (args.jev or args.kev) and invoked and not args.json:
-        dest = get_kev_url() if args.kev else OPENROUTER_DECISIONS_URL
-        print(f"[*] Decision Engine Active: Triage queries were evaluated by {dest}")
+        cfg = resolve_decision_config(
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            env_file=args.env_file,
+            use_kev=args.kev,
+        )
+        dest = cfg["base_url"]
+        model_label = f" (model: {cfg['model']})" if cfg.get("model") else ""
+        print(f"[*] Decision Engine Active: Triage queries were evaluated by {dest}{model_label}")
 
     # Format findings with relative paths for both JSON and terminal
     cwd = Path.cwd().resolve()

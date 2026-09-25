@@ -97,16 +97,26 @@ determify ./src
 
 Two options are available:
 
-1. **Cloud.** [TypeSafe Jev](https://docs.typesafe.ai) via the OpenRouter Decisions API.
+1. **Cloud / Managed API.** [TypeSafe Jev](https://docs.typesafe.ai) via TypeSafe's official System One API (`https://api.typesafe.ai/v1/systemone`), OpenRouter's Decisions API (`https://openrouter.ai/api/alpha/decisions`), or any custom endpoint/proxy.
 2. **Local or self-hosted.** **[Kev](https://github.com/jaredpalmer/kev).** Jared Palmer's open-weights 0.6B non-autoregressive decision model. It is fully API-compatible with TypeSafe System One, self-hosts on your own GPU or CPU for zero API fees, and returns a decision in under 90ms.
 
 #### 2. Intelligent triage with TypeSafe Jev (`--jev`)
 
-Pass suspicious call sites directly to TypeSafe Jev via the OpenRouter Decisions API. In under 100ms, Jev evaluates the surrounding code and classifies whether it is truly deterministic, a decision candidate, or legitimately generative.
+Pass suspicious call sites directly to TypeSafe Jev. In under 100ms, Jev evaluates the surrounding code and classifies whether it is truly deterministic, a decision candidate, or legitimately generative.
+
+You are never locked into a single provider:
 
 ```bash
-export OPENROUTER_API_KEY="your-key"
+# Option A: TypeSafe official endpoint (default)
+export TYPESAFE_API_KEY="your-typesafe-key"
 determify ./src --jev
+
+# Option B: OpenRouter
+export OPENROUTER_API_KEY="your-openrouter-key"
+determify ./src --jev
+
+# Option C: Custom endpoint or internal proxy via CLI flags
+determify ./src --base-url https://api.mycompany.ai/v1/systemone --api-key "$MY_KEY"
 ```
 
 #### 3. On-premises air-gapped triage with Kev-0.6B (`--kev`)
