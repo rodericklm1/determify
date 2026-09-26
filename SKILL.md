@@ -4,7 +4,7 @@ description: "Set up (with user consent) and execute the Determify CLI to audit 
 license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
-  version: "0.1.4"
+  version: "0.1.5"
   repository: "https://github.com/rodericklm1/determify"
 ---
 

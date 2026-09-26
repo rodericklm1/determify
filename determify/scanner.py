@@ -129,12 +129,16 @@ def scan_file(file_path: str, content: str = None):
     lines = content.splitlines()
     allowed = parse_allow_markers(lines) if "determify:allow" in content else {}
 
-    # DET-07: Direct SDK / CLI invocation inspection
+    # DET-07: Direct SDK / CLI invocation inspection (scripts and code files only; skip prose documentation)
     det07 = next((p for p in PATTERNS if p["id"] == "DET-07"), None)
-    if det07:
+    is_doc_file = file_path.endswith((".md", ".markdown", ".txt", ".rst"))
+    if det07 and not is_doc_file:
         for idx, line in enumerate(lines, 1):
             stripped = line.strip()
             if stripped.startswith(("#", "//", "/*", "*")):
+                continue
+            # Skip shell logging, echo, or process-supervision lines
+            if stripped.startswith(("echo ", "echo\t", "printf ", "printf\t", "pgrep ", "pkill ", "grep ", "log ", "which ")):
                 continue
             if det07["regex"].search(line):
                 reason = allowed.get(idx, {}).get(det07["id"])
