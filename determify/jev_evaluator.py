@@ -14,7 +14,7 @@ from pathlib import Path
 
 DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions")
-DEFAULT_KEV_URL = "http://localhost:8009/v1/systemone"
+DEFAULT_KEV_URL = os.environ.get("KEV_ENDPOINT", "http://10.0.0.20:8009/v1/systemone")
 MAX_RESPONSE_BYTES = 256_000
 ALLOWED_SCHEMES = ("http", "https")
 
@@ -260,12 +260,28 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
             raise RuntimeError(f"Unexpected response type from Kev ({type(data).__name__})")
         return data, "kev-0.6b (local)"
 
+    # Helper for transparent Kev fallback
+    def _call_kev_fallback(reason: str):
+        kev_url = os.environ.get("KEV_ENDPOINT", DEFAULT_KEV_URL)
+        kev_payload = dict(payload)
+        kev_payload["model"] = "kev-0.6b"
+        sys.stderr.write(f"[determify] Notice: Jev primary unavailable ({reason}); auto-falling back to Kev-0.6B on-prem ({kev_url})...\n")
+        kev_headers = {"Content-Type": "application/json"}
+        res = _post_json(kev_url, kev_payload, headers=kev_headers, timeout=5)
+        if not isinstance(res, dict):
+            raise RuntimeError(f"Unexpected response type from Kev fallback ({type(res).__name__})")
+        return res, "kev-0.6b (on-prem fallback)"
+
     if not cfg["api_key"]:
-        raise ValueError(
-            "No Jev API key found in environment or arguments.\n"
-            "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
-            "To use on-prem triage without an API key, use --kev."
-        )
+        # In the sovereign fleet, seamlessly fail over to Kev if no cloud key is present
+        try:
+            return _call_kev_fallback("no cloud API key found")
+        except Exception as kev_err:
+            raise ValueError(
+                f"No Jev API key found, and fallback to Kev failed ({kev_err}).\n"
+                "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
+                "To use on-prem triage directly without an API key, use --kev."
+            ) from kev_err
 
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -279,23 +295,32 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
     else:
         headers["User-Agent"] = "determify"
 
-    data = _post_json(
-        cfg["base_url"],
-        payload,
-        headers=headers,
-        timeout=8
-    )
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected response type from decision endpoint ({type(data).__name__})")
+    try:
+        data = _post_json(
+            cfg["base_url"],
+            payload,
+            headers=headers,
+            timeout=8
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected response type from decision endpoint ({type(data).__name__})")
 
-    if "openrouter.ai" in host:
-        provider_name = f"{cfg['model']} (openrouter.ai)"
-    elif "typesafe.ai" in host:
-        provider_name = f"{cfg['model']} (typesafe.ai)"
-    else:
-        provider_name = f"{cfg['model']} ({host or 'custom'})"
+        if "openrouter.ai" in host:
+            provider_name = f"{cfg['model']} (openrouter.ai)"
+        elif "typesafe.ai" in host:
+            provider_name = f"{cfg['model']} (typesafe.ai)"
+        else:
+            provider_name = f"{cfg['model']} ({host or 'custom'})"
 
-    return data, provider_name
+        return data, provider_name
+    except Exception as e:
+        # Transparent failover to local on-prem Kev
+        try:
+            return _call_kev_fallback(str(e))
+        except Exception as kev_err:
+            raise RuntimeError(
+                f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."
+            ) from e
 
 def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_url=None, api_key=None, model=None):
     """
