@@ -10,10 +10,12 @@ import stat
 import errno
 import concurrent.futures
 from pathlib import Path
-from .patterns import PATTERNS, CUE_PATTERNS
+from .patterns import PATTERNS, CUE_PATTERNS, LLM_CONTEXT_GATE
 from .jev_evaluator import evaluate_with_jev
 from .deep_scanner import deep_scan_file
 from .ast_scanner import scan_python_ast
+
+GATE_PREFILTER_RE = re.compile(LLM_CONTEXT_GATE, re.IGNORECASE)
 
 IGNORED_DIRS = {
     ".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -201,6 +203,11 @@ def scan_file(file_path: str, content: str = None):
     for line_idx, line in enumerate(lines, 1):
         stripped = line.strip()
         if stripped.startswith(("#", "//", "/*", "*")):
+            continue
+
+        # Fast gate pre-filter: DET-01 through DET-06 require an LLM context gate token.
+        # If the line contains no LLM context tokens, skip evaluating the 6 cue regexes.
+        if not GATE_PREFILTER_RE.search(line):
             continue
 
         for p in PATTERNS:
