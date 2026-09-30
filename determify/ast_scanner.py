@@ -1,35 +1,34 @@
 """
-ast_scanner.py - Python AST Syntactic Scanner for Determify.
-Performs zero-dependency, syntax-aware inspection of Python source code to detect
-deterministic AI waste, multiline f-strings, and ungated LLM call sites with 100% syntactic precision.
+ast_scanner.py - Syntax-Aware Python AST Scanner for Determify.
+Performs zero-dependency syntactic inspection of Python source code to detect
+deterministic AI waste, multiline f-strings, and ungated LLM call sites.
 """
 
 import ast
 import re
+import textwrap
 from .patterns import PATTERNS, CUE_PATTERNS
 
-# Specific signatures for DET-07 (ungated generative SDK / CLI invocation)
+# Specific method suffixes for DET-07 (ungated generative SDK invocations)
 EXPLICIT_SDK_ATTRS = {
     "completions.create",
     "chat.completions.create",
     "messages.create",
     "responses.create",
-    "complete",
     "generate_content",
 }
 
-EXPLICIT_CLASS_NAMES = {
+# Known chat model wrappers invoked directly or via methods
+EXPLICIT_CHAT_CLASSES = {
     "ChatOpenAI",
     "ChatAnthropic",
     "ChatGoogleGenerativeAI",
-    "OpenAI",
-    "Anthropic",
 }
 
 CLI_AGENT_COMMANDS = re.compile(r"\b(?:opencode\s+run|hermes\s+run|claude\s+-p|sgpt\s+-[soec])\b")
 
-# General LLM caller identifiers (distinguishes LLM calls from ORM/database calls)
-LLM_CALL_TOKENS = ("llm", "openai", "anthropic", "chat", "completion", "messages", "generate", "agent", "predict", "model")
+# Logging and debugging method names to explicitly ignore as non-LLM calls
+LOGGER_METHODS = {".info", ".debug", ".warning", ".error", ".log", ".critical", ".exception"}
 
 def _get_call_name(node: ast.Call) -> str:
     """Extracts a dot-separated string representation of a call target."""
@@ -62,18 +61,27 @@ def _extract_string_content(node: ast.AST) -> str:
     return ""
 
 class DetermifyASTVisitor(ast.NodeVisitor):
-    def __init__(self, file_path: str, lines: list, allowed: dict):
+    def __init__(self, file_path: str, lines: list, allowed: dict, record_exemption_fn=None):
         self.file_path = file_path
         self.lines = lines
         self.allowed = allowed
+        self.record_exemption_fn = record_exemption_fn
         self.findings = []
         self.seen_keys = set()
+        self.local_constants = {}  # var_name -> (text_value, lineno)
         self.pattern_map = {p["id"]: p for p in PATTERNS}
 
-    def _add_finding(self, rule_id: str, line_no: int, snippet: str):
+    def _add_finding(self, rule_id: str, line_no: int, snippet: str, call_start_line: int = None):
+        # Check suppression on the specific line, or on the parent call statement line if multiline
         reason = self.allowed.get(line_no, {}).get(rule_id)
+        if not reason and call_start_line is not None:
+            reason = self.allowed.get(call_start_line, {}).get(rule_id)
+
         if reason:
-            return  # Suppressed by # determify:allow
+            if self.record_exemption_fn:
+                self.record_exemption_fn(self.file_path, line_no, rule_id, reason)
+            return
+
         key = (self.file_path, line_no, rule_id)
         if key in self.seen_keys:
             return
@@ -90,16 +98,71 @@ class DetermifyASTVisitor(ast.NodeVisitor):
             "savings": rule.get("savings", "")
         })
 
+    def _record_assignment(self, target_names: list, value_node: ast.AST, line_no: int):
+        text = _extract_string_content(value_node)
+        if not text:
+            return
+
+        # Track constant in local scope for alias resolution in subsequent calls
+        for name in target_names:
+            self.local_constants[name] = (text, line_no)
+
+        val_snippet = self.lines[line_no - 1].strip() if line_no <= len(self.lines) else ""
+
+        # DET-07: Subprocess/CLI agent invocation strings (e.g. command = "opencode run summarize")
+        if CLI_AGENT_COMMANDS.search(text):
+            self._add_finding("DET-07", line_no, val_snippet)
+
+        # Explicit prompt variables (e.g. prompt = "What is today's date?", user_prompt = "...")
+        # Check for 'prompt' in variable name (avoids generic words like 'message' on UI strings)
+        is_prompt_var = any("prompt" in name for name in target_names)
+        if is_prompt_var:
+            for rule_id, cue_re in CUE_PATTERNS.items():
+                if cue_re.search(text):
+                    self._add_finding(rule_id, line_no, val_snippet)
+
+    def visit_Assign(self, node: ast.Assign):
+        target_names = []
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                target_names.append(target.id.lower())
+            elif isinstance(target, ast.Attribute):
+                target_names.append(target.attr.lower())
+
+        line_no = getattr(node, "lineno", 1)
+        self._record_assignment(target_names, node.value, line_no)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        # Support annotated assignments: prompt: str = "What is today's date?"
+        target_names = []
+        if isinstance(node.target, ast.Name):
+            target_names.append(node.target.id.lower())
+        elif isinstance(node.target, ast.Attribute):
+            target_names.append(node.target.attr.lower())
+
+        if node.value:
+            line_no = getattr(node, "lineno", 1)
+            self._record_assignment(target_names, node.value, line_no)
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call):
         call_name = _get_call_name(node)
         line_no = getattr(node, "lineno", 1)
         raw_line = self.lines[line_no - 1].strip() if line_no <= len(self.lines) else ""
 
+        # Ignore logging methods (eliminates model_logger.info("What is today's date?") false positives)
+        if any(call_name.endswith(log_m) for log_m in LOGGER_METHODS) or "logger" in call_name.lower():
+            self.generic_visit(node)
+            return
+
         # DET-07: Subprocess calls running agent CLIs (e.g. subprocess.run(["opencode", "run", ...]))
         if call_name in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "os.system"}:
             for arg in node.args:
                 text = _extract_string_content(arg)
-                if CLI_AGENT_COMMANDS.search(text):
+                if not text and isinstance(arg, ast.Name):
+                    text, _ = self.local_constants.get(arg.id.lower(), ("", 1))
+                if text and CLI_AGENT_COMMANDS.search(text):
                     self._add_finding("DET-07", line_no, raw_line)
                     break
 
@@ -109,63 +172,61 @@ class DetermifyASTVisitor(ast.NodeVisitor):
             if call_name.endswith(attr):
                 is_explicit_sdk = True
                 break
+
+        # LlamaIndex / Agent complete call: require qualified client context (avoids workflow.complete() false positive)
+        if not is_explicit_sdk and call_name.endswith(".complete"):
+            prefix = call_name.rsplit(".complete", 1)[0].lower()
+            if any(tok in prefix for tok in ("llm", "client", "model", "agent", "predictor")):
+                is_explicit_sdk = True
+
+        # Chat model classes
         if not is_explicit_sdk:
-            for cls_name in EXPLICIT_CLASS_NAMES:
+            for cls_name in EXPLICIT_CHAT_CLASSES:
                 if call_name == cls_name or call_name.endswith("." + cls_name):
                     is_explicit_sdk = True
                     break
 
         if is_explicit_sdk:
-            self._add_finding("DET-07", line_no, raw_line)
+            self._add_finding("DET-07", line_no, raw_line, call_start_line=line_no)
 
-        # Check if the call target is an AI/LLM mechanism (eliminates ORM/database false positives like Order.create or db.query)
-        is_llm_call = is_explicit_sdk or any(sig in call_name.lower() for sig in LLM_CALL_TOKENS)
+        # Check if the call target is an AI/LLM invocation
+        is_llm_call = is_explicit_sdk or any(
+            sig in call_name.lower()
+            for sig in ("llm.", "openai.", "anthropic.", "chat.", "agent.run", "model.predict", "llm_call")
+        )
 
         if is_llm_call:
             # Inspect all arguments passed to this verified LLM call for DET-01 through DET-06
             all_arg_nodes = list(node.args) + [kw.value for kw in node.keywords]
             for arg in all_arg_nodes:
                 text = _extract_string_content(arg)
+                arg_line = getattr(arg, "lineno", line_no)
+
+                # Constant propagation: resolve variable aliases (e.g. question = "..."; client.responses.create(input=question))
+                if not text and isinstance(arg, ast.Name):
+                    const_val, const_line = self.local_constants.get(arg.id.lower(), ("", arg_line))
+                    if const_val:
+                        text = const_val
+                        arg_line = const_line
+
                 if not text:
                     continue
-                arg_line = getattr(arg, "lineno", line_no)
+
                 arg_snippet = self.lines[arg_line - 1].strip() if arg_line <= len(self.lines) else raw_line
 
                 for rule_id, cue_re in CUE_PATTERNS.items():
                     if cue_re.search(text):
-                        self._add_finding(rule_id, arg_line, arg_snippet)
-
-        self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign):
-        # Detect assignments to prompt variables: prompt = "What is today's date?", messages = [...]
-        target_names = []
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                target_names.append(target.id.lower())
-            elif isinstance(target, ast.Attribute):
-                target_names.append(target.attr.lower())
-
-        is_prompt_var = any("prompt" in name or "message" in name or "input_text" in name for name in target_names)
-        if is_prompt_var:
-            text = _extract_string_content(node.value)
-            if text:
-                val_line = getattr(node.value, "lineno", getattr(node, "lineno", 1))
-                val_snippet = self.lines[val_line - 1].strip() if val_line <= len(self.lines) else ""
-                for rule_id, cue_re in CUE_PATTERNS.items():
-                    if cue_re.search(text):
-                        self._add_finding(rule_id, val_line, val_snippet)
+                        self._add_finding(rule_id, arg_line, arg_snippet, call_start_line=line_no)
 
         self.generic_visit(node)
 
 
-def scan_python_ast(file_path: str, content: str, allowed: dict) -> list:
+def scan_python_ast(file_path: str, content: str, allowed: dict, record_exemption_fn=None) -> list:
     """
     Parses Python content into an AST and inspects for Determify rules.
     Returns findings list if AST parsing succeeds, or None if syntax error or unparseable
     (to fall back to lexical scanner).
     """
-    import textwrap
     try:
         tree = ast.parse(content, filename=file_path)
     except IndentationError:
@@ -177,6 +238,6 @@ def scan_python_ast(file_path: str, content: str, allowed: dict) -> list:
         return None
 
     lines = content.splitlines()
-    visitor = DetermifyASTVisitor(file_path, lines, allowed)
+    visitor = DetermifyASTVisitor(file_path, lines, allowed, record_exemption_fn=record_exemption_fn)
     visitor.visit(tree)
     return visitor.findings

@@ -857,18 +857,21 @@ class TestDetermifyScanner(unittest.TestCase):
         self.assertIn("DET-04", ids)
 
     def test_include_docs_cli_flag(self):
-        """Markdown files are skipped by default but scanned when --include-docs is passed."""
+        """Markdown files are skipped by default but scanned and evaluated when --include-docs is passed."""
         with tempfile.TemporaryDirectory() as td:
             doc = Path(td) / "test_doc.md"
-            doc.write_text("What is today's date? prompt = true\n")
+            doc.write_text('prompt = "What is today\'s date?"\n')
             
             # Default scan: markdown is excluded
             scanned_def, findings_def, _ = scan_targets([td], include_docs=False)
             self.assertEqual(scanned_def, 0)
+            self.assertEqual(len(findings_def), 0)
             
-            # With include_docs: markdown is scanned
+            # With include_docs: markdown is scanned and evaluated
             scanned_inc, findings_inc, _ = scan_targets([td], include_docs=True)
             self.assertEqual(scanned_inc, 1)
+            self.assertEqual(len(findings_inc), 1)
+            self.assertEqual(findings_inc[0]["id"], "DET-01")
 
     def test_parallel_decision_triage_evaluates_findings(self):
         """When multiple findings exist, ThreadPoolExecutor evaluates them in parallel and records jev_eval."""
@@ -893,6 +896,96 @@ class TestDetermifyScanner(unittest.TestCase):
                 for f in findings:
                     self.assertIn("jev_eval", f)
                 self.assertEqual(len(calls), len(findings))
+
+
+class TestReviewerBoundaryChecklist(unittest.TestCase):
+    """
+    Direct verification of the 8 boundary test cases and exemption audit trail
+    provided in the external reviewer's regression CSV.
+    """
+
+    def _scan(self, content: str, suffix: str = ".py"):
+        from determify.scanner import EXEMPTIONS
+        EXEMPTIONS.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        return findings, list(EXEMPTIONS)
+
+    def test_case_1_unrelated_complete_method(self):
+        """'workflow.complete()' must NOT be flagged as an LLM SDK call (expected: 0 findings)."""
+        content = "workflow.complete()\ntask.complete()\n"
+        findings, _ = self._scan(content)
+        self.assertEqual(len(findings), 0, f"Expected 0 findings, got {findings}")
+
+    def test_case_2_ordinary_ui_message(self):
+        """'message = \"What is today's date?\"' printed to UI must NOT be flagged as an LLM call (expected: 0 findings)."""
+        content = 'message = "What is today\'s date?"\nprint(message)\n'
+        findings, _ = self._scan(content)
+        self.assertEqual(len(findings), 0, f"Expected 0 findings, got {findings}")
+
+    def test_case_3_non_llm_model_logger(self):
+        """'model_logger.info(\"What is today's date?\")' must NOT be flagged as an LLM call (expected: 0 findings)."""
+        content = 'model_logger.info("What is today\'s date?")\n'
+        findings, _ = self._scan(content)
+        self.assertEqual(len(findings), 0, f"Expected 0 findings, got {findings}")
+
+    def test_case_4_sdk_construction_only(self):
+        """'client = OpenAI()' is constructor setup, not a generative invocation (expected: 0 findings)."""
+        content = 'client = OpenAI()\nauth_client = Anthropic()\n'
+        findings, _ = self._scan(content)
+        self.assertEqual(len(findings), 0, f"Expected 0 findings, got {findings}")
+
+    def test_case_5_aliased_prompt_variable(self):
+        """'question = \"What is today's date?\"; client.responses.create(input=question)' must resolve the alias to DET-01 and DET-07."""
+        content = 'question = "What is today\'s date?"\nclient.responses.create(input=question)\n'
+        findings, _ = self._scan(content)
+        ids = {f["id"] for f in findings}
+        self.assertEqual(ids, {"DET-01", "DET-07"})
+
+    def test_case_6_annotated_prompt_assignment(self):
+        """'prompt: str = \"What is today's date?\"; client.responses.create(input=prompt)' must detect DET-01 and DET-07."""
+        content = 'prompt: str = "What is today\'s date?"\nclient.responses.create(input=prompt)\n'
+        findings, _ = self._scan(content)
+        ids = {f["id"] for f in findings}
+        self.assertEqual(ids, {"DET-01", "DET-07"})
+
+    def test_case_7_cli_string_in_valid_python(self):
+        """'command = \"opencode run summarize\"' must be recognized by AST as DET-07."""
+        content = 'command = "opencode run summarize"\n'
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertIn("DET-07", ids)
+
+    def test_case_8_multiline_call_site_exemption(self):
+        """A suppression marker placed on the call line must exempt DET-01 even if argument is on subsequent lines."""
+        content = (
+            "# determify:allow DET-01 Reviewed date injection\n"
+            "client.responses.create(\n"
+            "    input=\"What is today's date?\"\n"
+            ")\n"
+        )
+        findings, exemptions = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertNotIn("DET-01", ids, "DET-01 should have been exempted")
+        self.assertIn("DET-07", ids, "DET-07 should remain flagged since not exempted")
+        exempt_ids = [e["id"] for e in exemptions]
+        self.assertIn("DET-01", exempt_ids, "Exemption must be recorded in the audit trail")
+
+    def test_case_9_suppressed_python_sdk_call_records_exemption(self):
+        """Suppressed Python call enters the audit trail and is recorded in EXEMPTIONS."""
+        content = (
+            "# determify:allow DET-07 Intentional generative synthesis\n"
+            "client.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        )
+        findings, exemptions = self._scan(content)
+        self.assertEqual(len(findings), 0)
+        self.assertEqual(len(exemptions), 1)
+        self.assertEqual(exemptions[0]["id"], "DET-07")
+        self.assertEqual(exemptions[0]["reason"], "Intentional generative synthesis")
+
 
 if __name__ == "__main__":
     unittest.main()

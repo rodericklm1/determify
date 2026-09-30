@@ -131,9 +131,9 @@ def scan_file(file_path: str, content: str = None):
     lines = content.splitlines()
     allowed = parse_allow_markers(lines) if "determify:allow" in content else {}
 
-    # For Python files, run zero-dependency AST analysis first for 100% syntactic precision
+    # For Python files, run zero-dependency AST analysis first for high syntactic precision
     if file_path.endswith(".py"):
-        ast_findings = scan_python_ast(file_path, content, allowed)
+        ast_findings = scan_python_ast(file_path, content, allowed, record_exemption_fn=_record_exemption)
         if ast_findings is not None:
             return ast_findings
 
@@ -291,7 +291,7 @@ def _batches(files, batch_bytes):
 
 
 def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=False,
-              base_url=None, api_key=None, model=None):
+              base_url=None, api_key=None, model=None, allow_fallback=False):
     """Scans a single file. Returns (counted_bool, findings)."""
     content = read_source_file_safe(fpath, stats)
     if not content:
@@ -303,7 +303,8 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
         def _eval_item(item):
             v = evaluate_with_jev(
                 item, content, use_kev=use_kev, env_file=env_file,
-                base_url=base_url, api_key=api_key, model=model
+                base_url=base_url, api_key=api_key, model=model,
+                allow_fallback=allow_fallback
             )
             return item, v
 
@@ -334,7 +335,8 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
 
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
                  batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False,
-                 base_url=None, api_key=None, model=None, include_docs=False):
+                 base_url=None, api_key=None, model=None, include_docs=False,
+                 allow_fallback=False):
     """Scans target paths, partitioned into byte-budgeted batches.
 
     A large tree is split so that progress is observable and a timeout costs one
@@ -367,7 +369,8 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
         for fpath in batch:
             counted, findings = _scan_one(
                 fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug,
-                base_url=base_url, api_key=api_key, model=model
+                base_url=base_url, api_key=api_key, model=model,
+                allow_fallback=allow_fallback
             )
             if counted:
                 scanned_files += 1

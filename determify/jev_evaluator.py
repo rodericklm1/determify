@@ -231,9 +231,10 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 8):
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Malformed JSON response from {url}: {e}") from e
 
-def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None, api_key=None, model=None):
+def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None, api_key=None, model=None, allow_fallback=False):
     """
     Executes a decision request against on-prem Kev-0.6B or Cloud Jev (TypeSafe, OpenRouter, or custom).
+    Fails closed by default without unauthorized silent failover.
     """
     cfg = resolve_decision_config(
         base_url=base_url,
@@ -260,12 +261,12 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
             raise RuntimeError(f"Unexpected response type from Kev ({type(data).__name__})")
         return data, "kev-0.6b (local)"
 
-    # Helper for transparent Kev fallback
+    # Helper for explicit, authorized Kev fallback
     def _call_kev_fallback(reason: str):
         kev_url = os.environ.get("KEV_ENDPOINT", DEFAULT_KEV_URL)
         kev_payload = dict(payload)
         kev_payload["model"] = "kev-0.6b"
-        sys.stderr.write(f"[determify] Notice: Jev primary unavailable ({reason}); auto-falling back to Kev-0.6B on-prem ({kev_url})...\n")
+        sys.stderr.write(f"[determify] Notice: Jev primary unavailable ({reason}); falling back to authorized Kev ({kev_url})...\n")
         kev_headers = {"Content-Type": "application/json"}
         res = _post_json(kev_url, kev_payload, headers=kev_headers, timeout=5)
         if not isinstance(res, dict):
@@ -273,15 +274,21 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
         return res, "kev-0.6b (on-prem fallback)"
 
     if not cfg["api_key"]:
-        # In the sovereign fleet, seamlessly fail over to Kev if no cloud key is present
-        try:
-            return _call_kev_fallback("no cloud API key found")
-        except Exception as kev_err:
+        if allow_fallback:
+            try:
+                return _call_kev_fallback("no cloud API key found")
+            except Exception as kev_err:
+                raise ValueError(
+                    f"No Jev API key found, and fallback to Kev failed ({kev_err}).\n"
+                    "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
+                    "To use on-prem triage directly without an API key, use --kev."
+                ) from kev_err
+        else:
             raise ValueError(
-                f"No Jev API key found, and fallback to Kev failed ({kev_err}).\n"
+                "No Jev API key found in environment or arguments.\n"
                 "To use Jev triage, provide an API key via --api-key, JEV_API_KEY, TYPESAFE_API_KEY, OPENROUTER_API_KEY, or --env-file.\n"
                 "To use on-prem triage directly without an API key, use --kev."
-            ) from kev_err
+            )
 
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -314,15 +321,16 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
 
         return data, provider_name
     except Exception as e:
-        # Transparent failover to local on-prem Kev
-        try:
-            return _call_kev_fallback(str(e))
-        except Exception as kev_err:
-            raise RuntimeError(
-                f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."
-            ) from e
+        if allow_fallback:
+            try:
+                return _call_kev_fallback(str(e))
+            except Exception as kev_err:
+                raise RuntimeError(
+                    f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."
+                ) from e
+        raise
 
-def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_url=None, api_key=None, model=None):
+def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_url=None, api_key=None, model=None, allow_fallback=False):
     """
     Evaluates an identified code finding using Jev or Kev to determine optimal tier.
     """
@@ -389,6 +397,7 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_
         payload,
         use_kev=use_kev,
         env_file=env_file,
+        allow_fallback=allow_fallback,
         **extra_kwargs
     )
     lat_ms = round((time.time() - t0) * 1000, 1)

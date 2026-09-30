@@ -35,6 +35,7 @@ def _run_cli():
                         help="Split large trees into batches of this many MiB, reporting progress to stderr. "
                              "Default 50. Batching never changes the findings, only how much work happens per step.")
     parser.add_argument("--include-docs", action="store_true", help="Include markdown documentation (.md, .markdown) in scan")
+    parser.add_argument("--allow-fallback", action="store_true", help="Permit automatic fallback to local Kev if cloud Jev is unreachable or unconfigured")
     parser.add_argument("--no-progress", action="store_true", help="Suppress per-batch progress on stderr")
     parser.add_argument("--fail-on-findings", action="store_true", help="Exit with code 1 if any actionable findings are discovered (for CI/CD)")
     parser.add_argument("--json", action="store_true", help="Output findings in JSON format")
@@ -93,6 +94,7 @@ def _run_cli():
             api_key=args.api_key,
             model=args.model,
             include_docs=args.include_docs,
+            allow_fallback=args.allow_fallback,
         )
     except Exception as e:
         # Fail closed: stderr + exit 2, and do not print a clean or success report.

@@ -4,8 +4,8 @@ description: "Set up (with user consent) and execute the Determify CLI to audit 
 license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
-  skill_version: "0.1.3"
-  tested_cli_version: "0.1.5"
+  skill_version: "0.1.4"
+  tested_cli_version: "0.1.6"
   minimum_cli_version: "0.1.2"
   repository: "https://github.com/rodericklm1/determify"
 ---
@@ -72,7 +72,7 @@ If not found, **stop and ask the user** before installing. State exactly what wi
 
 ```bash
 # Option A: Pinned install from the tagged release (recommended)
-python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.5
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.6
 
 # Option B: Running from a local repository checkout (if auditing determify itself)
 python3 -m determify.cli -v
