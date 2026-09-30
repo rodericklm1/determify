@@ -79,7 +79,7 @@ pip install -e .
 
 ### 1. Standalone static scan (no API key, no setup)
 
-Scan any file or directory. `determify` runs offline and needs no configuration.
+Scan any file or directory. `determify` runs offline and needs no configuration. (Directory sweeps automatically ignore `.git/`, `node_modules/`, `venv/`, and `tests/` directories by default to focus on application code).
 
 ```bash
 # Scan current directory
@@ -172,9 +172,9 @@ flowchart LR
 
     subgraph TIERS["Execution Tiers"]
         direction TB
-        T0["🟢 Tier 0: Pure Code\nPOSIX / Python stdlib\nLatency: <2ms • Cost: $0.00"]
-        T05["⚡ Tier 0.5: Decision Models\nTypeSafe Jev / Kev-0.6B\nLatency: ~72ms • Cost: Fractions of a cent"]
-        T2["🟣 Tier 2+: Generative LLMs\nFrontier models\nLatency: 3-8s • Only when synthesis needed"]
+        T0["🟢 Tier 0: Pure Code\nPOSIX / Python stdlib\nSub-millisecond • Cost: $0.00"]
+        T05["⚡ Tier 0.5: Decision Models\nTypeSafe Jev / Kev-0.6B\nSub-100ms • Fractions of a cent"]
+        T2["🟣 Tier 2+: Generative LLMs\nFrontier models\nMulti-second • Only when synthesis needed"]
     end
 
     SCAN -- "Deterministic" --> T0

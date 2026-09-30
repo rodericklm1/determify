@@ -18,6 +18,10 @@ DEFAULT_KEV_URL = os.environ.get("KEV_ENDPOINT", "http://localhost:8009/v1/syste
 MAX_RESPONSE_BYTES = 256_000
 ALLOWED_SCHEMES = ("http", "https")
 
+class SecurityPolicyViolation(RuntimeError):
+    """Raised when an HTTP request violates security policies (scheme, redirect, size cap)."""
+    pass
+
 class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect and strip Authorization so it cannot be copied."""
 
@@ -33,7 +37,7 @@ class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         self._strip_authorization(req)
-        raise RuntimeError(f"Security violation: refusing HTTP redirect ({code}) to {newurl}")
+        raise SecurityPolicyViolation(f"Security violation: refusing HTTP redirect ({code}) to {newurl}")
 
     def http_error_302(self, req, fp, code, msg, headers):
         self._strip_authorization(req)
@@ -50,7 +54,7 @@ class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
                 or headers.get("uri")
                 or ""
             )
-        raise RuntimeError(f"Security violation: refusing HTTP redirect ({code}) to {location}")
+        raise SecurityPolicyViolation(f"Security violation: refusing HTTP redirect ({code}) to {location}")
 
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
@@ -211,7 +215,7 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 8):
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ALLOWED_SCHEMES:
-        raise RuntimeError(f"Refusing non-HTTP(S) endpoint scheme '{parsed.scheme}': {url}")
+        raise SecurityPolicyViolation(f"Refusing non-HTTP(S) endpoint scheme '{parsed.scheme}': {url}")
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -221,7 +225,7 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 8):
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise RuntimeError(f"Decision endpoint response exceeded {MAX_RESPONSE_BYTES} bytes")
+                raise SecurityPolicyViolation(f"Decision endpoint response exceeded {MAX_RESPONSE_BYTES} bytes")
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_msg = e.read(4096).decode("utf-8", errors="ignore")
@@ -263,11 +267,14 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
 
     # Helper for explicit, authorized Kev fallback
     def _call_kev_fallback(reason: str):
-        kev_url = os.environ.get("KEV_ENDPOINT", DEFAULT_KEV_URL)
+        kev_cfg = resolve_decision_config(use_kev=True, env_file=env_file)
+        kev_url = kev_cfg["base_url"]
         kev_payload = dict(payload)
-        kev_payload["model"] = "kev-0.6b"
+        kev_payload["model"] = kev_cfg["model"]
         sys.stderr.write(f"[determify] Notice: Jev primary unavailable ({reason}); falling back to authorized Kev ({kev_url})...\n")
         kev_headers = {"Content-Type": "application/json"}
+        if kev_cfg.get("api_key"):
+            kev_headers["Authorization"] = f"Bearer {kev_cfg['api_key']}"
         res = _post_json(kev_url, kev_payload, headers=kev_headers, timeout=5)
         if not isinstance(res, dict):
             raise RuntimeError(f"Unexpected response type from Kev fallback ({type(res).__name__})")
@@ -320,14 +327,13 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
             provider_name = f"{cfg['model']} ({host or 'custom'})"
 
         return data, provider_name
+    except SecurityPolicyViolation:
+        # Security policy violations must never trigger fallback under any circumstance
+        raise
     except Exception as e:
-        err_str = str(e)
-        # Security policy violations (scheme refusal, redirect violation, size cap) must never trigger fallback
-        if any(sec in err_str for sec in ("Security violation:", "Refusing non-HTTP(S)", "exceeded")):
-            raise
         if allow_fallback:
             try:
-                return _call_kev_fallback(err_str)
+                return _call_kev_fallback(str(e))
             except Exception as kev_err:
                 raise RuntimeError(
                     f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."

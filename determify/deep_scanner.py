@@ -11,7 +11,8 @@ from .jev_evaluator import call_decision_endpoint, resolve_decision_config
 SIGNAL_WORDS = ["prompt", "completion", "model", "llm", "invoke", "messages", "client"]
 
 def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=None, debug=False,
-                   base_url=None, api_key=None, model=None, allow_fallback=False):
+                   base_url=None, api_key=None, model=None, allow_fallback=False,
+                   allowed=None, record_exemption_fn=None):
     """
     Chunked semantic scan across files containing LLM signals.
     Requires an explicit decision provider (Jev or Kev).
@@ -137,6 +138,21 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
                         f"[deep] {file_path}:{signal_line} dropped by classifier "
                         f"(tier={rep_tier}, noul={unnecessary_prob:.2f})\n"
                     )
+                continue
+
+            # Check if DET-DEEP is exempted on signal_line, or anywhere across the chunk span
+            reason = None
+            if allowed:
+                reason = allowed.get(signal_line, {}).get("DET-DEEP")
+                if not reason:
+                    for l in range(start_line, end_line + 1):
+                        reason = allowed.get(l, {}).get("DET-DEEP")
+                        if reason:
+                            break
+
+            if reason:
+                if record_exemption_fn:
+                    record_exemption_fn(file_path, signal_line, "DET-DEEP", reason)
                 continue
 
             findings.append({

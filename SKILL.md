@@ -5,7 +5,7 @@ license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
   skill_version: "0.1.5"
-  tested_cli_version: "0.1.7"
+  tested_cli_version: "0.1.8"
   minimum_cli_version: "0.1.2"
   repository: "https://github.com/rodericklm1/determify"
 ---
@@ -54,7 +54,7 @@ Always inspect Determify's exit code before reporting anything to the user:
 
 | Exit code | Meaning | Required Agent Behavior |
 | :--- | :--- | :--- |
-| `0` | Scan completed successfully; no findings (or clean under `--fail-on-findings`). | Report clean status, including any skipped files. |
+| `0` | Execution succeeded. If `--fail-on-findings` was used, 0 means no unreviewed findings exist. If running a standard scan, check `total_findings` in JSON: 0 is clean, >0 requires triage. | Check `total_findings`. If 0, report clean with skipped count. If >0, proceed to Phase 3. |
 | `1` | Actionable findings present (when using `--fail-on-findings`). | Proceed to Phase 3 collaborative triage. |
 | `2` | Operational failure: missing target path, unreadable target, or decision engine error. stdout is empty. | Report the stderr error as an operational failure. **Never report an exit-2 run as clean.** |
 
@@ -72,7 +72,7 @@ If not found, **stop and ask the user** before installing. State exactly what wi
 
 ```bash
 # Option A: Pinned install from the tagged release (recommended)
-python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.7
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.8
 
 # Option B: Running from a local repository checkout (if auditing determify itself)
 python3 -m determify.cli -v
@@ -96,23 +96,25 @@ determify . --json
 ```
 
 ### 2. Large-Tree Context Defense & Bounded Output
-On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON or hitting shell argument buffer limits (`ARG_MAX`). Capture stdout to a file and check the exit code before parsing:
+On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON or hitting shell argument buffer limits (`ARG_MAX`). Capture stdout to an isolated temporary directory and check the exit code before parsing:
 
 ```bash
-determify . --json > /tmp/determify_report.json 2> /tmp/determify_stderr.log
+REPORT_DIR=$(mktemp -d /tmp/determify_scan.XXXXXX)
+trap 'rm -rf "$REPORT_DIR"' EXIT INT TERM
+determify . --json > "$REPORT_DIR/report.json" 2> "$REPORT_DIR/stderr.log"
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 2 ]; then
   echo "Determify operational error (exit 2):" >&2
-  cat /tmp/determify_stderr.log >&2
+  cat "$REPORT_DIR/stderr.log" >&2
 else
   # Note: When --fail-on-findings is not set, Determify returns exit 0 regardless of finding count.
   # Inspect total_findings in JSON to determine whether findings exist.
-  python3 -c "import json; d=json.load(open('/tmp/determify_report.json')); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]"
+  python3 -c "import json; d=json.load(open('$REPORT_DIR/report.json')); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]"
 fi
 ```
 
-**Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MiB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume; a terminated scan must be re-run from the start.
+**Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. Directory scans exclude `tests/` and `test/` by default. There is no resume; a terminated scan must be re-run from the start.
 
 ### 3. Optional Deep Semantic Inspection (`--deep`)
 If the user specifically asks for deep or semantic triage:

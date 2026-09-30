@@ -1083,6 +1083,114 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
             self.assertIn("Security violation", str(ctx.exception))
             self.assertEqual(len(fallback_called), 0, "Fallback must NOT be called on security violations")
 
+    def test_logger_subpath_does_not_mask_sdk_call(self):
+        """audit.logger.chat.completions.create(...) must be detected as DET-07, not masked by logger check."""
+        content = "audit.logger.chat.completions.create(messages=[])\n"
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertIn("DET-07", ids, f"Expected DET-07 for chat.completions.create, got {ids}")
+
+    def test_det_deep_allow_marker_exempts_finding(self):
+        """# determify:allow DET-DEEP reason properly suppresses semantic deep-scan findings."""
+        from determify.deep_scanner import deep_scan_file
+        from determify.scanner import parse_allow_markers, _record_exemption, EXEMPTIONS
+        EXEMPTIONS.clear()
+
+        def mock(payload, use_kev=False, env_file=None, **kwargs):
+            return {
+                "answers": {
+                    "contains_unnecessary_ai": {"noul": 0.95},
+                    "replacement_tier": {"choice": "clean_tier_0_code", "confidence": 0.90},
+                }
+            }, "mock"
+
+        content = (
+            "# determify:allow DET-DEEP Authorized semantic workflow\n"
+            "def run_ai():\n"
+            "    llm = client.messages.create(model='m', messages=[])\n"
+        )
+        lines = content.splitlines()
+        allowed = parse_allow_markers(lines)
+
+        with patch("determify.deep_scanner.call_decision_endpoint", mock):
+            findings = deep_scan_file(
+                "app.py", content, use_kev=True, allowed=allowed, record_exemption_fn=_record_exemption
+            )
+        self.assertEqual(len(findings), 0, "DET-DEEP should be exempted")
+        self.assertEqual(len(EXEMPTIONS), 1, "Exemption must be recorded in ledger")
+        self.assertEqual(EXEMPTIONS[0]["id"], "DET-DEEP")
+        self.assertEqual(EXEMPTIONS[0]["reason"], "Authorized semantic workflow")
+
+    def test_cli_allow_fallback_without_api_key(self):
+        """--jev --allow-fallback without API key does not fail preflight; triggers fallback."""
+        from determify.cli import _run_cli
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "test.py"
+            target.write_text("x = 1\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("sys.argv", ["determify", "--jev", "--allow-fallback", "--no-progress", str(target)]):
+                    # Should run clean on a clean file without exit 2
+                    try:
+                        _run_cli()
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0, f"Expected exit 0 for clean file under fallback, got {e.code}")
+
+    def test_lambda_scope_masks_outer_literal(self):
+        """Lambda parameters mask outer variable bindings, preventing false positives."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'f = lambda question: client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_for_loop_target_invalidates_binding(self):
+        """For-loop targets are dynamic and invalidate prior literal bindings."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'for question in incoming:\n'
+            '    client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_conditional_if_branch_invalidates_binding(self):
+        """Variables assigned conditionally inside if-branches are invalidated for subsequent code."""
+        content = (
+            'question = "Summarize this"\n'
+            'if condition:\n'
+            '    question = "What is today\'s date?"\n'
+            'client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_class_scope_does_not_leak_to_methods(self):
+        """Class namespace variables do not leak into inner method bodies."""
+        content = (
+            'class Example:\n'
+            '    question = "What is today\'s date?"\n'
+            '    def run(self):\n'
+            '        return client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_walrus_and_augassign_invalidation(self):
+        """Walrus dynamic assignment and augmented assignments invalidate bindings."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'question += get_dynamic_str()\n'
+            'client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,8 @@
 """
 ast_scanner.py - Syntax-Aware Python AST Scanner for Determify.
 Performs zero-dependency syntactic inspection of Python source code to detect
-deterministic AI waste, multiline f-strings, and ungated LLM call sites with scope-aware binding analysis.
+deterministic AI waste, multiline f-strings, and ungated LLM call sites with robust
+lexical scope stacks, conservative control-flow invalidation, and container alias resolution.
 """
 
 import ast
@@ -27,8 +28,8 @@ EXPLICIT_CHAT_CLASSES = {
 
 CLI_AGENT_COMMANDS = re.compile(r"\b(?:opencode\s+run|hermes\s+run|claude\s+-p|sgpt\s+-[soec])\b")
 
-# Logging and debugging method names to explicitly ignore as non-LLM calls
-LOGGER_METHODS = {".info", ".debug", ".warning", ".error", ".log", ".critical", ".exception"}
+# Standard logging and diagnostic method names (not model inference calls)
+LOGGER_METHODS = {"info", "debug", "warning", "error", "log", "critical", "exception"}
 
 def _get_call_name(node: ast.Call) -> str:
     """Extracts a dot-separated string representation of a call target."""
@@ -40,6 +41,14 @@ def _get_call_name(node: ast.Call) -> str:
     if isinstance(curr, ast.Name):
         parts.append(curr.id)
     return ".".join(reversed(parts))
+
+def _get_call_func_attr(node: ast.Call) -> str:
+    """Returns the final method name of a call (e.g. 'create' from 'client.chat.completions.create')."""
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    elif isinstance(node.func, ast.Name):
+        return node.func.id
+    return ""
 
 def _extract_string_content(node: ast.AST, scope_lookup=None, depth: int = 0) -> tuple:
     """
@@ -65,7 +74,7 @@ def _extract_string_content(node: ast.AST, scope_lookup=None, depth: int = 0) ->
         return " ".join(texts), origin_line
 
     elif isinstance(node, ast.Name) and scope_lookup:
-        # Resolve variable reference from scope stack
+        # Resolve variable reference from lexical scope stack
         resolved = scope_lookup(node.id)
         if resolved is not None:
             text_val, origin_line = resolved
@@ -116,8 +125,11 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.pattern_map = {p["id"]: p for p in PATTERNS}
 
     def _lookup_variable(self, name: str):
-        """Searches scope stack from innermost to outermost for variable binding."""
+        """Searches scope stack from innermost to outermost for variable binding, respecting class boundary isolation."""
         for scope in reversed(self.scopes):
+            # Class scopes are isolated namespaces; methods do not resolve class-level variables as bare names in Python
+            if scope.get("__is_class__"):
+                continue
             if name in scope:
                 return scope[name]
         return None
@@ -127,7 +139,7 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.scopes[-1][name] = val_info
 
     def _invalidate_variable(self, name: str):
-        """Invalidates a variable in the current scope frame (e.g. upon dynamic reassignment)."""
+        """Invalidates a variable in the current scope frame (e.g. upon dynamic reassignment or parameter masking)."""
         self.scopes[-1][name] = None
 
     def _add_finding(self, rule_id: str, line_no: int, snippet: str, call_start_line: int = None):
@@ -209,7 +221,6 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
-        # Support annotated assignments: prompt: str = "What is today's date?"
         line_no = getattr(node, "lineno", 1)
         if node.value:
             self._record_assignment([node.target], node.value, line_no)
@@ -217,6 +228,84 @@ class DetermifyASTVisitor(ast.NodeVisitor):
             if isinstance(node.target, ast.Name):
                 self._invalidate_variable(node.target.id)
         self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        # Augmented assignment (e.g. prompt += x) makes variable dynamic; invalidate
+        if isinstance(node.target, ast.Name):
+            self._invalidate_variable(node.target.id)
+        self.generic_visit(node)
+
+    def visit_Delete(self, node: ast.Delete):
+        # Explicit deletion (del question) invalidates variable
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self._invalidate_variable(target.id)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For):
+        # Loop iteration targets are dynamic; invalidate
+        for sub in ast.walk(node.target):
+            if isinstance(sub, ast.Name):
+                self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+        for sub in ast.walk(node.target):
+            if isinstance(sub, ast.Name):
+                self._invalidate_variable(sub.id)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor):
+        for sub in ast.walk(node.target):
+            if isinstance(sub, ast.Name):
+                self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+        for sub in ast.walk(node.target):
+            if isinstance(sub, ast.Name):
+                self._invalidate_variable(sub.id)
+
+    def visit_With(self, node: ast.With):
+        for item in node.items:
+            if item.optional_vars:
+                for sub in ast.walk(item.optional_vars):
+                    if isinstance(sub, ast.Name):
+                        self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith):
+        for item in node.items:
+            if item.optional_vars:
+                for sub in ast.walk(item.optional_vars):
+                    if isinstance(sub, ast.Name):
+                        self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler):
+        if node.name:
+            self._invalidate_variable(node.name)
+        self.generic_visit(node)
+
+    def visit_If(self, node: ast.If):
+        # Statically uncertain control flow: variables assigned conditionally are invalidated after the block
+        cond_assigned = set()
+        for stmt in node.body + node.orelse:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign):
+                    for t in sub.targets:
+                        if isinstance(t, ast.Name):
+                            cond_assigned.add(t.id)
+                elif isinstance(sub, ast.AnnAssign):
+                    if isinstance(sub.target, ast.Name):
+                        cond_assigned.add(sub.target.id)
+                elif isinstance(sub, ast.NamedExpr):
+                    if isinstance(sub.target, ast.Name):
+                        cond_assigned.add(sub.target.id)
+
+        self.visit(node.test)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+        for var_name in cond_assigned:
+            self._invalidate_variable(var_name)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         # Push new local function scope
@@ -234,7 +323,19 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.scopes.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        # Push new local async function scope
+        self.scopes.append({})
+        all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        for a in all_args:
+            self._invalidate_variable(a.arg)
+        if node.args.vararg:
+            self._invalidate_variable(node.args.vararg.arg)
+        if node.args.kwarg:
+            self._invalidate_variable(node.args.kwarg.arg)
+
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_Lambda(self, node: ast.Lambda):
         self.scopes.append({})
         all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
         for a in all_args:
@@ -248,20 +349,52 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.scopes.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        # Push new class scope
+        # Class definitions create an isolated namespace that is not part of the lexical closure chain for methods
+        self.scopes.append({"__is_class__": True})
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_ListComp(self, node: ast.ListComp):
         self.scopes.append({})
+        for gen in node.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_SetComp(self, node: ast.SetComp):
+        self.scopes.append({})
+        for gen in node.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_DictComp(self, node: ast.DictComp):
+        self.scopes.append({})
+        for gen in node.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    self._invalidate_variable(sub.id)
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        self.scopes.append({})
+        for gen in node.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    self._invalidate_variable(sub.id)
         self.generic_visit(node)
         self.scopes.pop()
 
     def visit_Call(self, node: ast.Call):
         call_name = _get_call_name(node)
+        func_attr = _get_call_func_attr(node)
         line_no = getattr(node, "lineno", 1)
         raw_line = self.lines[line_no - 1].strip() if line_no <= len(self.lines) else ""
-
-        # Ignore logging methods (eliminates model_logger.info("What is today's date?") false positives)
-        if any(call_name.endswith(log_m) for log_m in LOGGER_METHODS) or "logger" in call_name.lower():
-            self.generic_visit(node)
-            return
 
         # DET-07: Subprocess calls running agent CLIs (e.g. subprocess.run(["opencode", "run", ...]))
         if call_name in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "os.system"}:
@@ -294,10 +427,14 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         if is_explicit_sdk:
             self._add_finding("DET-07", line_no, raw_line, call_start_line=line_no)
 
-        # Check if the call target is an AI/LLM invocation
-        is_llm_call = is_explicit_sdk or any(
-            sig in call_name.lower()
-            for sig in ("llm.", "openai.", "anthropic.", "chat.", "agent.run", "model.predict", "llm_call")
+        # Check if the call is an AI/LLM invocation
+        # Exclude standard logging calls (e.g. logger.info, model_logger.debug) unless it's a verified SDK call
+        is_logger_call = func_attr in LOGGER_METHODS and ("logger" in call_name.lower() or "log" in call_name.lower())
+        is_llm_call = is_explicit_sdk or (
+            not is_logger_call and any(
+                sig in call_name.lower()
+                for sig in ("llm.", "openai.", "anthropic.", "chat.", "agent.run", "model.predict", "llm_call")
+            )
         )
 
         if is_llm_call:

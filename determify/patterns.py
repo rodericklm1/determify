@@ -41,7 +41,7 @@ PATTERNS = [
         "description": "Prompting an LLM for current date, relative dates, or timezone calculations.",
         "regex": _cue(CUE_RAW["DET-01"]),
         "fix": "Use datetime.now(), datetime.timedelta, moment/dayjs, or POSIX 'date -d' / 'date +%Y-%m-%d'",
-        "savings": "100% token elimination ($0.00), <1ms latency"
+        "savings": "100% token elimination ($0.00), sub-millisecond local execution"
     },
     {
         "id": "DET-02",
@@ -49,7 +49,7 @@ PATTERNS = [
         "description": "Using an LLM to check if a file exists, count files in a directory, or resolve file paths.",
         "regex": _cue(CUE_RAW["DET-02"]),
         "fix": "Use os.path.exists(), pathlib.Path, glob.glob(), or POSIX 'find' / 'test -f'",
-        "savings": "100% token elimination ($0.00), 0ms network latency"
+        "savings": "100% token elimination ($0.00), zero network latency"
     },
     {
         "id": "DET-03",
@@ -57,7 +57,7 @@ PATTERNS = [
         "description": "Using an LLM to extract YAML frontmatter, JSON fields, or markdown headers.",
         "regex": _cue(CUE_RAW["DET-03"]),
         "fix": r"Use json.loads(), gray-matter (JS), or regex for bounded headers. For arbitrary YAML, use PyYAML (yaml.safe_load) or ruamel.yaml",
-        "savings": "100% token elimination, zero hallucination risk"
+        "savings": "Zero token cost ($0.00), deterministic parsing"
     },
     {
         "id": "DET-04",
@@ -65,7 +65,7 @@ PATTERNS = [
         "description": "Prompting an LLM to determine PDF page counts or classify document size.",
         "regex": _cue(CUE_RAW["DET-04"]),
         "fix": "Use 'pdfinfo <file.pdf>', pypdf, pdfjs, or os.path.getsize",
-        "savings": "Instant execution, 100% precision"
+        "savings": "Instant execution, deterministic page count"
     },
     {
         "id": "DET-05",
@@ -81,7 +81,7 @@ PATTERNS = [
         "description": "Using an LLM to check for literal keyword presence or category membership when exact keywords suffice.",
         "regex": _cue(CUE_RAW["DET-06"]),
         "fix": "Use Python 'in' operator, regex word boundaries, or 'grep -E'",
-        "savings": "Instant execution, eliminates unnecessary API trips"
+        "savings": "Instant execution, literal membership check"
     },
     {
         "id": "DET-07",

@@ -63,7 +63,7 @@ def _run_cli():
         sys.exit(2)
 
     # Pre-flight check for Cloud / Custom Jev
-    if args.jev and not args.kev:
+    if args.jev and not args.kev and not args.allow_fallback:
         cfg = resolve_decision_config(
             base_url=args.base_url,
             api_key=args.api_key,

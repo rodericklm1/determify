@@ -327,10 +327,13 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
             raise RuntimeError(f"decision engine failed closed: {e}") from e
 
     if deep_scan:
+        lines = content.splitlines()
+        allowed = parse_allow_markers(lines) if "determify:allow" in content else {}
         try:
             deep_findings = deep_scan_file(
                 fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug,
-                base_url=base_url, api_key=api_key, model=model, allow_fallback=allow_fallback
+                base_url=base_url, api_key=api_key, model=model, allow_fallback=allow_fallback,
+                allowed=allowed, record_exemption_fn=_record_exemption
             )
         except Exception as e:
             raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e
