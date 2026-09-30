@@ -110,7 +110,7 @@ elif [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ]; then
 fi
 ```
 
-**Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MiB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume—a terminated scan must be re-run from the start.
+**Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MiB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume; a terminated scan must be re-run from the start.
 
 ### 3. Optional Deep Semantic Inspection (`--deep`)
 If the user specifically asks for deep or semantic triage:
@@ -247,7 +247,7 @@ Use these deterministic patterns when collaborating on fixes:
    ```bash
    determify . --fail-on-findings
    ```
-   *Exit code must be `0`. An exit code of `2` is an operational failure—report the stderr message; do not claim verification. A clean run confirms no documented DET-01–07 rule matched; it is not a proof of absence.*
+   *Exit code must be `0`. An exit code of `2` is an operational failure: report the stderr message; do not claim verification. A clean run confirms no documented DET-01–07 rule matched; it is not a proof of absence.*
 3. **Present Savings Ledger:**
    ```markdown
    ## 🏆 Determify Optimization Summary

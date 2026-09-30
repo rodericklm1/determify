@@ -61,7 +61,7 @@ Install into your preferred agent harness using the open skills standard:
 npx skills add rodericklm1/determify
 ```
 
-The AI skill handles environment checking and CLI execution under the hood, interprets the findings by architectural tier (Tier 0 vs Tier 0.5 vs Tier 2+), and **collaborates with you on every change**—proposing concrete diffs and waiting for your approval before modifying code.
+The AI skill handles environment checking and CLI execution under the hood, interprets the findings by architectural tier (Tier 0 vs Tier 0.5 vs Tier 2+), and **collaborates with you on every change**, proposing concrete diffs and waiting for your approval before modifying code.
 
 ---
 
