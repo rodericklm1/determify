@@ -986,6 +986,103 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
         self.assertEqual(exemptions[0]["id"], "DET-07")
         self.assertEqual(exemptions[0]["reason"], "Intentional generative synthesis")
 
+    def test_case_10_reassigned_dynamic_value(self):
+        """Dynamic reassignment invalidates prior literal, preventing false positives."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'question = get_user_request()\n'
+            'client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_case_11_cross_function_leakage(self):
+        """Local variable bindings in one function must not leak into another function."""
+        content = (
+            'def first():\n'
+            '    question = "What is today\'s date?"\n\n'
+            'def second(question):\n'
+            '    return client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_case_12_case_sensitive_identifiers(self):
+        """Identifier case sensitivity is preserved: Question binds accurately."""
+        content = (
+            'Question = "What is today\'s date?"\n'
+            'client.responses.create(input=Question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = {f["id"] for f in findings}
+        self.assertEqual(ids, {"DET-01", "DET-07"})
+
+    def test_case_13_nested_message_reference(self):
+        """Recursive container resolution detects prompt variables inside messages=[{content: var}]."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'client.chat.completions.create(\n'
+            '    messages=[{"role": "user", "content": question}]\n'
+            ')\n'
+        )
+        findings, _ = self._scan(content)
+        ids = {f["id"] for f in findings}
+        self.assertEqual(ids, {"DET-01", "DET-07"})
+
+    def test_case_14_assignment_alias_chain(self):
+        """Alias chains (q = question) propagate the constant value to the call site."""
+        content = (
+            'question = "What is today\'s date?"\n'
+            'q = question\n'
+            'client.responses.create(input=q)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = {f["id"] for f in findings}
+        self.assertEqual(ids, {"DET-01", "DET-07"})
+
+    def test_case_15_attribute_name_collision(self):
+        """Attribute assignments (obj.question = ...) do not overwrite or bind bare local variables."""
+        content = (
+            'obj.question = "What is today\'s date?"\n'
+            'question = "Safe documentation note"\n'
+            'client.responses.create(input=question)\n'
+        )
+        findings, _ = self._scan(content)
+        ids = [f["id"] for f in findings]
+        self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+    def test_deep_scan_honors_allow_fallback(self):
+        """deep_scan_file passes allow_fallback flag to call_decision_endpoint."""
+        from determify.deep_scanner import deep_scan_file
+        passed_kwargs = {}
+        def mock_call(payload, use_kev=False, env_file=None, **kwargs):
+            passed_kwargs.update(kwargs)
+            return {"answers": {}}, "mock"
+
+        content = "llm = client.messages.create(model='m', messages=[])\n"
+        with patch("determify.deep_scanner.call_decision_endpoint", mock_call):
+            deep_scan_file("test.py", content, use_kev=False, allow_fallback=True)
+        self.assertTrue(passed_kwargs.get("allow_fallback"))
+
+    def test_security_policy_refusal_does_not_trigger_fallback(self):
+        """Security policy violations (e.g. redirect refusal) fail closed and never fall back even with allow_fallback=True."""
+        from determify.jev_evaluator import call_decision_endpoint
+        def mock_post(url, payload, headers, timeout=8):
+            raise RuntimeError("Security violation: refusing HTTP redirect (302) to http://127.0.0.1/steal")
+
+        fallback_called = []
+        def mock_kev(payload, use_kev=False, env_file=None, **kwargs):
+            fallback_called.append(True)
+            return {}, "kev"
+
+        with patch("determify.jev_evaluator._post_json", mock_post):
+            with self.assertRaises(RuntimeError) as ctx:
+                call_decision_endpoint({"model": "test"}, api_key="sk-test", allow_fallback=True)
+            self.assertIn("Security violation", str(ctx.exception))
+            self.assertEqual(len(fallback_called), 0, "Fallback must NOT be called on security violations")
+
 
 if __name__ == "__main__":
     unittest.main()

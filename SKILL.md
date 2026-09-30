@@ -4,8 +4,8 @@ description: "Set up (with user consent) and execute the Determify CLI to audit 
 license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
-  skill_version: "0.1.4"
-  tested_cli_version: "0.1.6"
+  skill_version: "0.1.5"
+  tested_cli_version: "0.1.7"
   minimum_cli_version: "0.1.2"
   repository: "https://github.com/rodericklm1/determify"
 ---
@@ -72,7 +72,7 @@ If not found, **stop and ask the user** before installing. State exactly what wi
 
 ```bash
 # Option A: Pinned install from the tagged release (recommended)
-python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.6
+python3 -m pip install --user git+https://github.com/rodericklm1/determify.git@v0.1.7
 
 # Option B: Running from a local repository checkout (if auditing determify itself)
 python3 -m determify.cli -v
@@ -96,17 +96,19 @@ determify . --json
 ```
 
 ### 2. Large-Tree Context Defense & Bounded Output
-On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON. In standard shells without `set -o pipefail`, directly piping into Python masks Determify's exit code. Use this exit-safe capture pattern that inspects the return code before parsing:
+On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON or hitting shell argument buffer limits (`ARG_MAX`). Capture stdout to a file and check the exit code before parsing:
 
 ```bash
-RAW_JSON=$(determify . --json 2>determify_stderr.log)
+determify . --json > /tmp/determify_report.json 2> /tmp/determify_stderr.log
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 2 ]; then
   echo "Determify operational error (exit 2):" >&2
-  cat determify_stderr.log >&2
-elif [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ]; then
-  python3 -c "import sys,json; d=json.loads(sys.argv[1]); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]" "$RAW_JSON"
+  cat /tmp/determify_stderr.log >&2
+else
+  # Note: When --fail-on-findings is not set, Determify returns exit 0 regardless of finding count.
+  # Inspect total_findings in JSON to determine whether findings exist.
+  python3 -c "import json; d=json.load(open('/tmp/determify_report.json')); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]"
 fi
 ```
 

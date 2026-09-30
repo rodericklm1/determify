@@ -11,7 +11,7 @@ from .jev_evaluator import call_decision_endpoint, resolve_decision_config
 SIGNAL_WORDS = ["prompt", "completion", "model", "llm", "invoke", "messages", "client"]
 
 def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=None, debug=False,
-                   base_url=None, api_key=None, model=None):
+                   base_url=None, api_key=None, model=None, allow_fallback=False):
     """
     Chunked semantic scan across files containing LLM signals.
     Requires an explicit decision provider (Jev or Kev).
@@ -75,6 +75,8 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
         extra_kwargs["api_key"] = api_key
     if model is not None:
         extra_kwargs["model"] = model
+    if allow_fallback:
+        extra_kwargs["allow_fallback"] = True
 
     def _eval_chunk(chunk_info):
         start_line, end_line, signal_line, chunk_text = chunk_info

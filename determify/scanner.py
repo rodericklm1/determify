@@ -323,7 +323,7 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
         try:
             deep_findings = deep_scan_file(
                 fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug,
-                base_url=base_url, api_key=api_key, model=model
+                base_url=base_url, api_key=api_key, model=model, allow_fallback=allow_fallback
             )
         except Exception as e:
             raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e

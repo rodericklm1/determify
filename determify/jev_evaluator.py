@@ -321,9 +321,13 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
 
         return data, provider_name
     except Exception as e:
+        err_str = str(e)
+        # Security policy violations (scheme refusal, redirect violation, size cap) must never trigger fallback
+        if any(sec in err_str for sec in ("Security violation:", "Refusing non-HTTP(S)", "exceeded")):
+            raise
         if allow_fallback:
             try:
-                return _call_kev_fallback(str(e))
+                return _call_kev_fallback(err_str)
             except Exception as kev_err:
                 raise RuntimeError(
                     f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."
