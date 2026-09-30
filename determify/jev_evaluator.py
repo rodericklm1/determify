@@ -14,7 +14,7 @@ from pathlib import Path
 
 DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions")
-DEFAULT_KEV_URL = os.environ.get("KEV_ENDPOINT", "http://10.0.0.20:8009/v1/systemone")
+DEFAULT_KEV_URL = os.environ.get("KEV_ENDPOINT", "http://localhost:8009/v1/systemone")
 MAX_RESPONSE_BYTES = 256_000
 ALLOWED_SCHEMES = ("http", "https")
 

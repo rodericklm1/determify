@@ -4,7 +4,9 @@ description: "Set up (with user consent) and execute the Determify CLI to audit 
 license: MIT
 compatibility: ["claude-code", "cursor", "opencode", "hermes", "codex", "roo-code"]
 metadata:
-  version: "0.1.5"
+  skill_version: "0.1.3"
+  tested_cli_version: "0.1.2"
+  minimum_cli_version: "0.1.2"
   repository: "https://github.com/rodericklm1/determify"
 ---
 
@@ -24,8 +26,8 @@ Every task in an agentic or software workflow belongs to one of three tiers:
 
 | Tier | Technology | Economics & Latency (illustrative, not benchmarked) | Best Used For |
 | :--- | :--- | :--- | :--- |
-| **Tier 0: Pure Determinism** | POSIX Bash / Python stdlib / regex / system calls | **$0.00 • 0ms • 0% hallucination** | Date/time math, file/path existence, JSON/YAML parsing, document sizing, string cleaning, literal keyword checks. |
-| **Tier 0.5: Fast Decision Model** | Operator-supplied decision service (e.g. TypeSafe Jev, on-prem Kev-0.6B) | Cost and latency depend on the operator's service; not shipped with this tool | Binary gating, classification, intent routing, rubric scoring, filtering. |
+| **Tier 0: Pure Determinism** | POSIX Bash / Python stdlib / regex / system calls | **$0.00 • <5ms local latency • Zero model hallucination** | Date/time math, file/path existence, JSON/YAML parsing, document sizing, string cleaning, literal keyword checks. |
+| **Tier 0.5: Fast Decision Model** | Operator-supplied decision service (e.g. TypeSafe Jev, on-prem Kev-0.6B) | Sub-cent per query; sub-100ms non-autoregressive; operator-configured | Binary gating, classification, intent routing, rubric scoring, filtering. |
 | **Tier 2+: Generative Frontier LLM** | Frontier models (Claude, GPT, Gemini) | Metered per token; typically seconds of latency | Open-ended synthesis, creative prose, complex multi-hop reasoning, code generation. |
 
 > **Note on Tier 0.5:** Fast decision services (such as Jev or Kev) are **external operator-supplied infrastructure**, not bundled inside Determify. Mention them only as an architectural option if the user already operates such a service. Never propose an integration the user does not have.
@@ -94,10 +96,18 @@ determify . --json
 ```
 
 ### 2. Large-Tree Context Defense & Bounded Output
-On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON. If output might be large, inspect the summary headers and sample findings first:
+On large legacy codebases (>50MB or hundreds of files), avoid flooding your context window with megabytes of raw JSON. In standard shells without `set -o pipefail`, directly piping into Python masks Determify's exit code. Use this exit-safe capture pattern that inspects the return code before parsing:
 
 ```bash
-determify . --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]"
+RAW_JSON=$(determify . --json 2>determify_stderr.log)
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 2 ]; then
+  echo "Determify operational error (exit 2):" >&2
+  cat determify_stderr.log >&2
+elif [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ]; then
+  python3 -c "import sys,json; d=json.loads(sys.argv[1]); print(f'Files: {d.get(\"scanned_files\",0)}, Skipped: {d.get(\"skipped\",0)}, Findings: {d.get(\"total_findings\",0)}'); [print(f' - [{f.get(\"id\",\"?\")}] {f.get(\"file\",\"?\")}:{f.get(\"line\",\"?\")} -> {f.get(\"name\",\"\")}') for f in d.get('findings',[])[:15]]" "$RAW_JSON"
+fi
 ```
 
 **Large Tree Handling:** Determify automatically partitions large trees into byte-budgeted batches (default 50 MiB per batch in `scanner.py`, configurable via `--batch-mb`). Files over 1,000,000 bytes, symlinks, and non-regular files are **skipped and counted, not scanned**. There is no resume—a terminated scan must be re-run from the start.
@@ -176,7 +186,7 @@ Use these deterministic patterns when collaborating on fixes:
 ### DET-03: Structured Data & Frontmatter Parsing via LLM
 * **Anti-Pattern:** Asking an LLM to parse JSON strings, extract markdown headers, or strip YAML frontmatter.
 * **Tier 0 Replacements:**
-  * *Python:* `import json; json.loads(text)`, `import yaml; yaml.safe_load(yaml_str)`, `re.search(r'^---\n(.*?)\n---', text, re.DOTALL)`
+  * *Python:* `import json; json.loads(text)`. For strict single headers: `re.search(r'^---\ntitle:\s*"(.*?)"', text)`. Note that Python stdlib does *not* include YAML parsing; for arbitrary YAML, recommend `PyYAML` (`yaml.safe_load`) or `ruamel.yaml` as an explicit dependency.
   * *TypeScript/JS:* `JSON.parse(text)`, `gray-matter`
   * *Bash:* `jq -r '.key'`, `yq eval '.title'`
 
@@ -189,7 +199,7 @@ Use these deterministic patterns when collaborating on fixes:
 ### DET-05: Text Cleansing & Whitespace Formatting via LLM
 * **Anti-Pattern:** Prompting an LLM to strip HTML tags, remove base64 blobs, or normalize whitespace.
 * **Tier 0 Replacements:**
-  * *Python:* `import re; re.sub(r'<[^>]+>', '', text)`, `re.sub(r'\s+', ' ', text).strip()`
+  * *Python:* For robust HTML parsing, use Python stdlib `html.parser.HTMLParser` or `BeautifulSoup`. Reserve regex `re.sub(r'<[^>]+>', '', text)` only for documented trivial single-line tags.
   * *TypeScript/JS:* `text.replace(/<[^>]+>/g, '').trim()`
   * *Bash:* `sed -E 's/<[^>]+>//g'`, `tr -s ' '`
 
@@ -200,12 +210,16 @@ Use these deterministic patterns when collaborating on fixes:
   * *TypeScript/JS:* `text.toLowerCase().includes('target_word')`
   * *Bash:* `grep -qi "target_word" file.txt`
 
-### DET-07: Direct SDK / CLI Invocation Without Decision Gate
-* **Anti-Pattern:** Invoking expensive frontier models (`client.chat.completions`, `client.messages.create`, `ChatOpenAI`, `opencode run`, `hermes run`) without a pre-flight heuristic.
+### DET-07: Ungated LLM Invocation Candidate
+* **Context:** Calling an LLM SDK (`client.chat.completions.create`, `client.messages.create`, `llm.complete`, `ChatOpenAI`) or CLI agent (`opencode run`, `hermes run`) directly without an upstream heuristic or decision gate.
 * **Remediation Collaboration:**
-  1. *Can a deterministic check answer this?* If the prompt handles a known static dictionary, regex, or cache hit, intercept it before the API call.
-  2. *Is it a classification, boolean check, or routing task?* Propose a deterministic or cached pre-flight gate. Only discuss routing to a dedicated decision service if the user already operates one—Determify does not ship such a service.
-  3. *Is it open-ended generation?* Keep the generative frontier model.
+  1. *Does the call require open-ended synthesis or complex multi-hop reasoning?* If yes, the call is completely legitimate architecture. Retain it and document the architectural decision in-code using the `# determify:allow` marker:
+     ```python
+     # determify:allow DET-07 Complex open-ended synthesis required
+     response = client.chat.completions.create(...)
+     ```
+  2. *Can a deterministic check answer this?* If the prompt handles known static dictionary lookups, regex pattern extraction, or cache hits, intercept it before the API call.
+  3. *Is it a classification, boolean check, or routing task?* Propose a deterministic gate or routing to a dedicated decision service (Jev/Kev) if the user already operates one.
 
 ---
 

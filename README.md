@@ -20,29 +20,29 @@ Every task in an agentic pipeline belongs to one of three tiers:
 %%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '13px' }}}%%
 flowchart TD
     Task([Incoming Task / Operation]) --> T0{Can it be solved with math, regex, or system calls?}
-    T0 -- Yes --> Tier0[Tier 0: Pure Determinism\nPOSIX Bash / Python stdlib\n$0.00 • 0ms latency • 0% hallucination]
+    T0 -- Yes --> Tier0[Tier 0: Pure Determinism\nPOSIX Bash / Python stdlib\n$0.00 • <5ms local latency • Zero model hallucination]
     T0 -- No --> T05{Is it a categorical choice, filtering, or scoring judgment?}
-    T05 -- Yes --> Tier05[Tier 0.5: Fast Decision Model\nTypeSafe Jev / On-Prem Kev-0.6B\n$0.000042 • <100ms latency]
-    T05 -- No --> TierFrontier[Tier 2+: Generative Frontier LLM\nFrontier models\n$3-$15/MTok • 3,000-10,000ms latency]
+    T05 -- Yes --> Tier05[Tier 0.5: Fast Decision Model\nTypeSafe Jev / On-Prem Kev-0.6B\nSub-cent • <100ms non-autoregressive]
+    T05 -- No --> TierFrontier[Tier 2+: Generative Frontier LLM\nFrontier models\nMetered per token • Multi-second generation]
 ```
 
-- **Tier 0. Pure deterministic code.** File checks, YAML and JSON extraction, relative timestamps, regex cleaning, line counts. Standard code handles all of it.
-- **Tier 0.5. Non-autoregressive decision models** (TypeSafe Jev, Kev-0.6B). Classification, routing, intent gating, rubric scoring, relevance filtering. Answers in under 100ms and emits zero output tokens.
+- **Tier 0. Pure deterministic code.** File checks, JSON extraction, relative timestamps, regex cleaning, line counts. Standard code handles all of it with zero model hallucinations (standard software correctness and tests still apply).
+- **Tier 0.5. Non-autoregressive decision models** (TypeSafe Jev, Kev-0.6B). Fast categorization, routing, intent gating, rubric scoring, relevance filtering. Answers in under 100ms with zero output tokens.
 - **Tier 2+. Generative frontier LLMs.** Open-ended generation, creative writing, synthesis, multi-hop reasoning. Reserved strictly for tasks that require deep cognitive synthesis.
 
 ---
 
 ## 🔍 What determify detects
 
-| Rule ID | Category | Common AI anti-pattern | Cheaper fix |
+| Rule ID | Category | Common AI candidate | Cheaper fix |
 | :--- | :--- | :--- | :--- |
 | **DET-01** | Date / time math | Prompting an LLM for today's date or relative time formatting | `datetime.now()`, `timedelta`, `date -d` |
 | **DET-02** | File / path checks | Asking an LLM if a file exists or listing files | `os.path.exists()`, `pathlib.Path`, `glob` |
-| **DET-03** | Structured parsing | Prompting an LLM to extract YAML frontmatter or headers | `yaml.safe_load()`, `json.loads()`, regex |
+| **DET-03** | Structured parsing | Prompting an LLM to extract YAML frontmatter or headers | `json.loads()`, `re.search()`, or `yaml.safe_load()` (`PyYAML`) |
 | **DET-04** | Document sizing | Using an LLM to count PDF pages or classify size | `pdfinfo`, `pypdf`, `os.path.getsize` |
-| **DET-05** | Text cleaning | Prompting an LLM to strip HTML tags or whitespace | `re.sub()`, `BeautifulSoup`, `sed` / `tr` |
+| **DET-05** | Text cleaning | Prompting an LLM to strip HTML tags or whitespace | `html.parser`, `BeautifulSoup`, `re.sub()`, `sed` / `tr` |
 | **DET-06** | Keyword checks | Using an LLM to test for exact string or token membership | Python `in` operator, `grep -E` |
-| **DET-07** | Ungated AI invocation | Invoking raw LLM SDKs or CLI agents without a decision gate | Route through a Tier 0 or Tier 0.5 gate first |
+| **DET-07** | Ungated AI invocation | Direct model call without upstream check or gate | Check if gate is justified; if synthesis, keep with `# determify:allow` |
 | **DET-DEEP** | Semantic LLM misuse | Subtle data formatting, basic triage, or redundant chaining | Chunked semantic analysis with Jev or Kev |
 
 ---
@@ -203,6 +203,21 @@ flowchart LR
 - **SDK call sites.** `openai.completions.create`, `openai.chat.completions.create`, `anthropic.messages.create`, `client.chat.completions`, `client.messages.create`, `client.responses.create`, `llm.complete`, `model.generate_content`.
 - **Chat model classes.** `ChatOpenAI(...)`, `ChatAnthropic(...)` (LangChain).
 - **Agent CLIs and subprocesses.** `opencode run`, `hermes run`, `claude -p`, `sgpt -s/-o/-e/-c`.
+
+---
+
+## 🏷️ Intentional Generative Calls & Exemptions
+
+Direct model invocations are not inherently defects. When an LLM call legitimately requires open-ended creative generation, deep multi-hop reasoning, or synthesis, document the architectural decision in-code using the `# determify:allow` marker:
+
+```python
+# determify:allow DET-07 Complex multi-step reasoning required
+response = client.chat.completions.create(model="gpt-4o", messages=[...])
+```
+
+- **Inline or Preceding Comment:** Place `# determify:allow <ID> <reason>` on the call site line or on the comment line immediately preceding it.
+- **CI/CD Integration:** When run with `--fail-on-findings`, Determify passes cleanly (exit code `0`) if all flagged sites have documented exemptions.
+- **Audit Trail:** Exemptions are reported under `[exempt]` in terminal output and `"exempted"` in JSON summaries so your team retains visibility over authorized generative calls.
 
 ---
 

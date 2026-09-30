@@ -8,10 +8,12 @@ import re
 import sys
 import stat
 import errno
+import concurrent.futures
 from pathlib import Path
-from .patterns import PATTERNS
+from .patterns import PATTERNS, CUE_PATTERNS
 from .jev_evaluator import evaluate_with_jev
 from .deep_scanner import deep_scan_file
+from .ast_scanner import scan_python_ast
 
 IGNORED_DIRS = {
     ".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -19,7 +21,7 @@ IGNORED_DIRS = {
 }
 
 SUPPORTED_EXTENSIONS = {
-    ".py", ".ts", ".js", ".jsx", ".tsx", ".sh", ".bash"
+    ".py", ".ts", ".js", ".jsx", ".tsx", ".sh", ".bash", ".prompt"
 }
 
 MAX_FILE_BYTES = 1_000_000  # 1,000,000 byte cap prevents memory exhaustion on minified bundles
@@ -129,6 +131,42 @@ def scan_file(file_path: str, content: str = None):
     lines = content.splitlines()
     allowed = parse_allow_markers(lines) if "determify:allow" in content else {}
 
+    # For Python files, run zero-dependency AST analysis first for 100% syntactic precision
+    if file_path.endswith(".py"):
+        ast_findings = scan_python_ast(file_path, content, allowed)
+        if ast_findings is not None:
+            return ast_findings
+
+    # For .prompt files, inspect cue patterns directly since the whole file is prompt content
+    if file_path.endswith(".prompt"):
+        for line_idx, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "//")):
+                continue
+            for p in PATTERNS:
+                if p["id"] == "DET-07":
+                    continue
+                cue_re = CUE_PATTERNS.get(p["id"])
+                if cue_re and cue_re.search(line):
+                    reason = allowed.get(line_idx, {}).get(p["id"])
+                    if reason:
+                        _record_exemption(file_path, line_idx, p["id"], reason)
+                        continue
+                    key = (file_path, line_idx, p["id"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        findings.append({
+                            "id": p["id"],
+                            "file": file_path,
+                            "line": line_idx,
+                            "snippet": stripped[:120],
+                            "name": p["name"],
+                            "description": p["description"],
+                            "fix": p["fix"],
+                            "savings": p["savings"]
+                        })
+        return findings
+
     # DET-07: Direct SDK / CLI invocation inspection (scripts and code files only; skip prose documentation)
     det07 = next((p for p in PATTERNS if p["id"] == "DET-07"), None)
     is_doc_file = file_path.endswith((".md", ".markdown", ".txt", ".rst"))
@@ -189,13 +227,15 @@ def scan_file(file_path: str, content: str = None):
 
     return findings
 
-def _iter_target_files(targets):
+def _iter_target_files(targets, include_docs=False):
     """Yields (fpath, size_bytes) for every supported file under the given targets.
 
     Enumerating separately from scanning is what lets us batch by byte budget and
     report progress before the work starts, instead of discovering the tree size
     only as we consume it.
     """
+    active_extensions = (SUPPORTED_EXTENSIONS | {".md", ".markdown"}) if include_docs else SUPPORTED_EXTENSIONS
+
     for t in targets:
         p = Path(t)
         if not p.exists():
@@ -211,7 +251,7 @@ def _iter_target_files(targets):
                 dirs[:] = [sub for sub in dirs if sub not in IGNORED_DIRS]
                 for fname in files:
                     ext = Path(fname).suffix.lower()
-                    is_candidate = ext in SUPPORTED_EXTENSIONS
+                    is_candidate = ext in active_extensions
                     fpath = os.path.join(root, fname)
 
                     if not is_candidate and not ext:
@@ -260,19 +300,23 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
     findings = scan_file(fpath, content=content)
 
     if (use_jev or use_kev) and findings:
-        for item in findings:
-            try:
-                verdict = evaluate_with_jev(
-                    item, content, use_kev=use_kev, env_file=env_file,
-                    base_url=base_url, api_key=api_key, model=model
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    f"decision engine failed closed for {item.get('file')}:{item.get('line')}: {e}"
-                ) from e
-            if verdict:
-                item["jev_eval"] = verdict
-                stats["invoked"] = True
+        def _eval_item(item):
+            v = evaluate_with_jev(
+                item, content, use_kev=use_kev, env_file=env_file,
+                base_url=base_url, api_key=api_key, model=model
+            )
+            return item, v
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(findings))) as executor:
+                futures = [executor.submit(_eval_item, item) for item in findings]
+                for fut in concurrent.futures.as_completed(futures):
+                    item, verdict = fut.result()
+                    if verdict:
+                        item["jev_eval"] = verdict
+                        stats["invoked"] = True
+        except Exception as e:
+            raise RuntimeError(f"decision engine failed closed: {e}") from e
 
     if deep_scan:
         try:
@@ -290,7 +334,7 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
 
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
                  batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False,
-                 base_url=None, api_key=None, model=None):
+                 base_url=None, api_key=None, model=None, include_docs=False):
     """Scans target paths, partitioned into byte-budgeted batches.
 
     A large tree is split so that progress is observable and a timeout costs one
@@ -308,7 +352,7 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
     scanned_files = 0
     stats = {"skipped": 0, "invoked": False}
 
-    enumerated = list(_iter_target_files(targets))
+    enumerated = list(_iter_target_files(targets, include_docs=include_docs))
     batches = list(_batches(enumerated, batch_bytes))
 
     if progress and len(batches) > 1:

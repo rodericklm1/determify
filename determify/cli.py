@@ -34,6 +34,7 @@ def _run_cli():
     parser.add_argument("--batch-mb", type=int, default=None,
                         help="Split large trees into batches of this many MiB, reporting progress to stderr. "
                              "Default 50. Batching never changes the findings, only how much work happens per step.")
+    parser.add_argument("--include-docs", action="store_true", help="Include markdown documentation (.md, .markdown) in scan")
     parser.add_argument("--no-progress", action="store_true", help="Suppress per-batch progress on stderr")
     parser.add_argument("--fail-on-findings", action="store_true", help="Exit with code 1 if any actionable findings are discovered (for CI/CD)")
     parser.add_argument("--json", action="store_true", help="Output findings in JSON format")
@@ -91,6 +92,7 @@ def _run_cli():
             base_url=args.base_url,
             api_key=args.api_key,
             model=args.model,
+            include_docs=args.include_docs,
         )
     except Exception as e:
         # Fail closed: stderr + exit 2, and do not print a clean or success report.

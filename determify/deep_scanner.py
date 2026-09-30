@@ -5,6 +5,7 @@ Scans functions and script blocks using Jev or Kev to find unflagged, implicit L
 
 import sys
 import time
+import concurrent.futures
 from .jev_evaluator import call_decision_endpoint, resolve_decision_config
 
 SIGNAL_WORDS = ["prompt", "completion", "model", "llm", "invoke", "messages", "client"]
@@ -41,6 +42,7 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
     )
 
     reported_spans = set()
+    candidate_chunks = []
     i = 0
     while i < len(lines):
         chunk_lines = lines[i:i + chunk_size]
@@ -61,12 +63,25 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
         if signal_line in reported_spans:
             continue
         reported_spans.add(signal_line)
+        candidate_chunks.append((start_line, end_line, signal_line, chunk_text))
 
+    if not candidate_chunks:
+        return findings
+
+    extra_kwargs = {}
+    if base_url is not None:
+        extra_kwargs["base_url"] = base_url
+    if api_key is not None:
+        extra_kwargs["api_key"] = api_key
+    if model is not None:
+        extra_kwargs["model"] = model
+
+    def _eval_chunk(chunk_info):
+        start_line, end_line, signal_line, chunk_text = chunk_info
         state = (
             f"File: {file_path} (Lines {start_line}-{end_line}, first signal at {signal_line})\n\n"
             f"Code Chunk:\n{chunk_text[:2000]}"
         )
-
         payload = {
             "model": cfg["model"],
             "state": state,
@@ -86,16 +101,7 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
                 }
             }
         }
-
         t0 = time.time()
-        extra_kwargs = {}
-        if base_url is not None:
-            extra_kwargs["base_url"] = base_url
-        if api_key is not None:
-            extra_kwargs["api_key"] = api_key
-        if model is not None:
-            extra_kwargs["model"] = model
-
         data, provider_name = call_decision_endpoint(
             payload,
             use_kev=use_kev,
@@ -103,45 +109,53 @@ def deep_scan_file(file_path, file_content, use_kev=False, env_file=None, stats=
             **extra_kwargs
         )
         lat_ms = round((time.time() - t0) * 1000, 1)
-        if stats is not None:
-            stats["invoked"] = True
+        return chunk_info, data, provider_name, lat_ms
 
-        ans = data.get("answers", {}) or {}
-        noul_item = ans.get("contains_unnecessary_ai", {})
-        raw_noul = noul_item.get("noul", 0.0) if isinstance(noul_item, dict) else 0.0
-        unnecessary_prob = float(raw_noul) if isinstance(raw_noul, (int, float)) else 0.0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(candidate_chunks))) as executor:
+        futures = [executor.submit(_eval_chunk, c) for c in candidate_chunks]
+        for fut in concurrent.futures.as_completed(futures):
+            chunk_info, data, provider_name, lat_ms = fut.result()
+            start_line, end_line, signal_line, _ = chunk_info
+            if stats is not None:
+                stats["invoked"] = True
 
-        tier_item = ans.get("replacement_tier", {})
-        rep_tier = tier_item.get("choice", "legitimate_generative") if isinstance(tier_item, dict) else "legitimate_generative"
-        raw_conf = tier_item.get("confidence", 0.0) if isinstance(tier_item, dict) else 0.0
-        tier_conf = float(raw_conf) if isinstance(raw_conf, (int, float)) else 0.0
+            ans = data.get("answers", {}) or {}
+            noul_item = ans.get("contains_unnecessary_ai", {})
+            raw_noul = noul_item.get("noul", 0.0) if isinstance(noul_item, dict) else 0.0
+            unnecessary_prob = float(raw_noul) if isinstance(raw_noul, (int, float)) else 0.0
 
-        if not (unnecessary_prob >= 0.70 and rep_tier != "legitimate_generative"):
-            if debug:
-                sys.stderr.write(
-                    f"[deep] {file_path}:{signal_line} dropped by classifier "
-                    f"(tier={rep_tier}, noul={unnecessary_prob:.2f})\n"
-                )
-            continue
+            tier_item = ans.get("replacement_tier", {})
+            rep_tier = tier_item.get("choice", "legitimate_generative") if isinstance(tier_item, dict) else "legitimate_generative"
+            raw_conf = tier_item.get("confidence", 0.0) if isinstance(tier_item, dict) else 0.0
+            tier_conf = float(raw_conf) if isinstance(raw_conf, (int, float)) else 0.0
 
-        findings.append({
-            "id": "DET-DEEP",
-            "file": file_path,
-            "line": signal_line,
-            "start_line": start_line,
-            "end_line": end_line,
-            "snippet": lines[signal_line - 1].strip()[:100],
-            "name": "Semantic LLM Overuse Detected (Deep Scan)",
-            "description": f"Semantic analysis flagged unnecessary generative AI logic (probability {unnecessary_prob:.2f}).",
-            "fix": f"Refactor to {rep_tier.replace('_', ' ').title()}.",
-            "savings": "Eliminates high-latency generative roundtrips",
-            "jev_eval": {
-                "optimal_tier": rep_tier,
-                "provider": provider_name,
-                "confidence": round(tier_conf, 2),
-                "deterministic_prob": round(unnecessary_prob, 2),
-                "latency_ms": lat_ms
-            }
-        })
+            if not (unnecessary_prob >= 0.70 and rep_tier != "legitimate_generative"):
+                if debug:
+                    sys.stderr.write(
+                        f"[deep] {file_path}:{signal_line} dropped by classifier "
+                        f"(tier={rep_tier}, noul={unnecessary_prob:.2f})\n"
+                    )
+                continue
 
+            findings.append({
+                "id": "DET-DEEP",
+                "file": file_path,
+                "line": signal_line,
+                "start_line": start_line,
+                "end_line": end_line,
+                "snippet": lines[signal_line - 1].strip()[:100],
+                "name": "Semantic LLM Overuse Detected (Deep Scan)",
+                "description": f"Semantic analysis flagged unnecessary generative AI logic (probability {unnecessary_prob:.2f}).",
+                "fix": f"Refactor to {rep_tier.replace('_', ' ').title()}.",
+                "savings": "Eliminates high-latency generative roundtrips",
+                "jev_eval": {
+                    "optimal_tier": rep_tier,
+                    "provider": provider_name,
+                    "confidence": round(tier_conf, 2),
+                    "deterministic_prob": round(unnecessary_prob, 2),
+                    "latency_ms": lat_ms
+                }
+            })
+
+    findings.sort(key=lambda x: x["line"])
     return findings

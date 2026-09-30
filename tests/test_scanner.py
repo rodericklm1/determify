@@ -802,5 +802,97 @@ class TestDetermifyScanner(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_orm_and_database_methods_not_flagged(self):
+        """ORM and database queries like Order.create(format_date()) or db.query() must not trigger false positives."""
+        content = """
+        class OrderService:
+            def create_order(self, db, order_data):
+                # ORM call using create
+                order = Order.create(format_date(order_data['timestamp']))
+                # Database query call
+                records = db.query("check if file exists in records")
+                user = User.objects.create(name="test")
+                return order
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        self.assertEqual(len(findings), 0, f"Expected 0 findings on ORM/DB code, got {findings}")
+
+    def test_ast_multiline_fstring_prompt_detected(self):
+        """AST scanner inspects multi-line f-strings passed into verified LLM client calls."""
+        content = '''
+        def get_summary(client, user_id):
+            prompt = f"""
+            You are a helpful assistant.
+            What is today's date?
+            Please provide the full schedule.
+            """
+            return client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}]
+            )
+        '''
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        ids = [x["id"] for x in findings]
+        self.assertIn("DET-07", ids)
+        self.assertIn("DET-01", ids)
+
+    def test_prompt_file_extension_detected_without_gate(self):
+        """A .prompt file is recognized by default and evaluated for cues directly."""
+        content = "You are an agent. What is today's date? Count the pages in the pdf.\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".prompt", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        ids = [x["id"] for x in findings]
+        self.assertIn("DET-01", ids)
+        self.assertIn("DET-04", ids)
+
+    def test_include_docs_cli_flag(self):
+        """Markdown files are skipped by default but scanned when --include-docs is passed."""
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "test_doc.md"
+            doc.write_text("What is today's date? prompt = true\n")
+            
+            # Default scan: markdown is excluded
+            scanned_def, findings_def, _ = scan_targets([td], include_docs=False)
+            self.assertEqual(scanned_def, 0)
+            
+            # With include_docs: markdown is scanned
+            scanned_inc, findings_inc, _ = scan_targets([td], include_docs=True)
+            self.assertEqual(scanned_inc, 1)
+
+    def test_parallel_decision_triage_evaluates_findings(self):
+        """When multiple findings exist, ThreadPoolExecutor evaluates them in parallel and records jev_eval."""
+        content = """
+        prompt1 = "What is today's date?"
+        prompt2 = "Count the pages in the pdf."
+        client.chat.completions.create(model="gpt-4", messages=[])
+        """
+        calls = []
+        def mock_eval(payload, use_kev=False, env_file=None, **kwargs):
+            calls.append(payload)
+            return {"answers": {"optimal_tier": {"choice": "tier_0_deterministic", "confidence": 0.95}}}, "mock"
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "test.py"
+            p.write_text(content)
+            with patch("determify.jev_evaluator.call_decision_endpoint", mock_eval):
+                scanned, findings, stats = scan_targets([td], use_kev=True)
+                self.assertEqual(scanned, 1)
+                self.assertGreaterEqual(len(findings), 2)
+                self.assertTrue(stats["invoked"])
+                for f in findings:
+                    self.assertIn("jev_eval", f)
+                self.assertEqual(len(calls), len(findings))
+
 if __name__ == "__main__":
     unittest.main()
