@@ -41,6 +41,7 @@ venv.bak/
 .coverage
 .coverage.*
 htmlcov/
+uv.lock
 
 # IDE & OS
 .idea/
