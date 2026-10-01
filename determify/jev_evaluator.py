@@ -4,6 +4,7 @@ Secure HTTP handling, redirect protection, scheme validation, and bounded respon
 """
 
 import os
+import sys
 import json
 import stat
 import time
@@ -17,9 +18,26 @@ OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "https://o
 DEFAULT_KEV_URL = os.environ.get("KEV_ENDPOINT", "http://localhost:8009/v1/systemone")
 MAX_RESPONSE_BYTES = 256_000
 ALLOWED_SCHEMES = ("http", "https")
+TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 class SecurityPolicyViolation(RuntimeError):
     """Raised when an HTTP request violates security policies (scheme, redirect, size cap)."""
+    pass
+
+class AvailabilityError(RuntimeError):
+    """
+    Typed transient availability failure: connection refused, timeout, or a
+    selected retryable HTTP status (429 / 5xx). This is the ONLY failure class
+    that may trigger an authorized fallback.
+    """
+    pass
+
+class PermanentServiceError(RuntimeError):
+    """Typed non-retryable HTTP status from the decision endpoint (401, 403, 404, 400...)."""
+    pass
+
+class ResponseFormatError(RuntimeError):
+    """Typed protocol-level defect: malformed JSON, undecodable body, or unexpected response type."""
     pass
 
 class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -228,17 +246,36 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 8):
                 raise SecurityPolicyViolation(f"Decision endpoint response exceeded {MAX_RESPONSE_BYTES} bytes")
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err_msg = e.read(4096).decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP {e.code} from {url}: {err_msg}") from e
+        # Read a bounded error excerpt, then close explicitly: HTTPError wraps the
+        # response socket and implicit GC cleanup surfaces ResourceWarnings.
+        try:
+            err_msg = e.read(4096).decode("utf-8", errors="ignore")
+        finally:
+            e.close()
+        # Typed classification by status code only; no message sniffing.
+        if e.code == 429 or 500 <= e.code < 600 or e.code == 408:
+            raise AvailabilityError(f"HTTP {e.code} (transient) from {url}: {err_msg}") from e
+        raise PermanentServiceError(f"HTTP {e.code} (permanent) from {url}: {err_msg}") from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Connection failed to {url}: {e.reason}") from e
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Malformed JSON response from {url}: {e}") from e
+        if isinstance(e.reason, SecurityPolicyViolation):
+            raise e.reason from e
+        raise AvailabilityError(f"Connection failed to {url}: {e.reason}") from e
+    except OSError as e:
+        # Raw socket-level timeouts/resets that bypassed the URLError wrapper.
+        raise AvailabilityError(f"Connection failed to {url}: {e}") from e
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ResponseFormatError(f"Malformed JSON response from {url}: {e}") from e
 
-def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None, api_key=None, model=None, allow_fallback=False):
+def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None, api_key=None, model=None, allow_fallback=False, fallback_info=None):
     """
     Executes a decision request against on-prem Kev-0.6B or Cloud Jev (TypeSafe, OpenRouter, or custom).
     Fails closed by default without unauthorized silent failover.
+
+    Returns the public (data, provider_name) tuple. When the caller passes a dict
+    as `fallback_info` and an authorized fallback is used, it is populated with
+    structured metadata: {"used": True, "reason": "no_api_key"|"availability",
+    "primary_url": ..., "fallback_url": ..., "contacted_primary": bool}.
+    Consumers must branch on these fields, never on provider-string matching.
     """
     cfg = resolve_decision_config(
         base_url=base_url,
@@ -247,6 +284,13 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
         env_file=env_file,
         use_kev=use_kev,
     )
+
+    # Resolve the fallback destination exactly once per call. It is derived from
+    # Kev-only inputs (endpoint env/model config, including --env-file), so the
+    # primary CLI-supplied credential in `cfg` can never leak into fallback headers.
+    kev_cfg = None
+    if allow_fallback and not use_kev:
+        kev_cfg = resolve_decision_config(use_kev=True, env_file=env_file)
 
     if "model" not in payload or payload.get("model") in ("~typesafe/jev-latest", "jev-latest", "kev-latest"):
         payload["model"] = cfg["model"]
@@ -262,28 +306,50 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
             timeout=5
         )
         if not isinstance(data, dict):
-            raise RuntimeError(f"Unexpected response type from Kev ({type(data).__name__})")
+            raise ResponseFormatError(f"Unexpected response type from Kev ({type(data).__name__})")
         return data, "kev-0.6b (local)"
 
-    # Helper for explicit, authorized Kev fallback
-    def _call_kev_fallback(reason: str):
-        kev_cfg = resolve_decision_config(use_kev=True, env_file=env_file)
+    def _call_kev_fallback(reason: str, reason_detail: str, contacted_primary: bool):
+        # Helper for explicit, authorized Kev fallback. Availability-gated at every
+        # call site; a policy, auth, or format failure must reach here never.
         kev_url = kev_cfg["base_url"]
+        if fallback_info is not None:
+            fallback_info.clear()
+            fallback_info.update({
+                "used": True,
+                "reason": reason,
+                "reason_detail": reason_detail[:200],
+                "primary_url": cfg["base_url"],
+                "fallback_url": kev_url,
+                "contacted_primary": contacted_primary,
+            })
         kev_payload = dict(payload)
         kev_payload["model"] = kev_cfg["model"]
-        sys.stderr.write(f"[determify] Notice: Jev primary unavailable ({reason}); falling back to authorized Kev ({kev_url})...\n")
+        if contacted_primary:
+            notice = (
+                f"[determify] Notice: primary endpoint {cfg['base_url']} returned a transient "
+                f"availability failure ({reason_detail[:200]}); falling back to authorized Kev at {kev_url}...\n"
+            )
+        else:
+            notice = (
+                f"[determify] Notice: no cloud API key configured; primary endpoint {cfg['base_url']} "
+                f"was not contacted; falling back to authorized Kev at {kev_url}...\n"
+            )
+        sys.stderr.write(notice)
         kev_headers = {"Content-Type": "application/json"}
         if kev_cfg.get("api_key"):
             kev_headers["Authorization"] = f"Bearer {kev_cfg['api_key']}"
         res = _post_json(kev_url, kev_payload, headers=kev_headers, timeout=5)
         if not isinstance(res, dict):
-            raise RuntimeError(f"Unexpected response type from Kev fallback ({type(res).__name__})")
+            raise ResponseFormatError(f"Unexpected response type from Kev fallback ({type(res).__name__})")
         return res, "kev-0.6b (on-prem fallback)"
 
     if not cfg["api_key"]:
         if allow_fallback:
             try:
-                return _call_kev_fallback("no cloud API key found")
+                # Missing key is a configuration state, not a primary outage:
+                # the primary endpoint was never contacted.
+                return _call_kev_fallback("no_cloud_key", "no cloud API key found", contacted_primary=False)
             except Exception as kev_err:
                 raise ValueError(
                     f"No Jev API key found, and fallback to Kev failed ({kev_err}).\n"
@@ -316,29 +382,30 @@ def call_decision_endpoint(payload, use_kev=False, env_file=None, base_url=None,
             headers=headers,
             timeout=8
         )
-        if not isinstance(data, dict):
-            raise RuntimeError(f"Unexpected response type from decision endpoint ({type(data).__name__})")
-
-        if "openrouter.ai" in host:
-            provider_name = f"{cfg['model']} (openrouter.ai)"
-        elif "typesafe.ai" in host:
-            provider_name = f"{cfg['model']} (typesafe.ai)"
-        else:
-            provider_name = f"{cfg['model']} ({host or 'custom'})"
-
-        return data, provider_name
-    except SecurityPolicyViolation:
-        # Security policy violations must never trigger fallback under any circumstance
-        raise
-    except Exception as e:
+    except AvailabilityError as e:
+        # Only typed transient availability failures may reach the authorized fallback.
+        # SecurityPolicyViolation, PermanentServiceError (401/403/404/400),
+        # ResponseFormatError, and programming errors intentionally fall through.
         if allow_fallback:
             try:
-                return _call_kev_fallback(str(e))
+                return _call_kev_fallback("transient_availability", str(e), contacted_primary=True)
             except Exception as kev_err:
                 raise RuntimeError(
                     f"Decision engine failure: Primary Jev failed ({e}), and fallback Kev failed ({kev_err})."
                 ) from e
         raise
+
+    if not isinstance(data, dict):
+        raise ResponseFormatError(f"Unexpected response type from decision endpoint ({type(data).__name__})")
+
+    if "openrouter.ai" in host:
+        provider_name = f"{cfg['model']} (openrouter.ai)"
+    elif "typesafe.ai" in host:
+        provider_name = f"{cfg['model']} (typesafe.ai)"
+    else:
+        provider_name = f"{cfg['model']} ({host or 'custom'})"
+
+    return data, provider_name
 
 def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_url=None, api_key=None, model=None, allow_fallback=False):
     """
@@ -373,8 +440,8 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_
                 "type": "choice",
                 "instructions": "Determine the optimal architectural tier for this operation.",
                 "criteria": {
-                    "tier_0_deterministic": "Can be completely solved with deterministic code: regex, datetime, os/path, jq, git, or bash pipe ($0.00, 0ms).",
-                    "tier_05_decision": "Is a classification, boolean check, filtering, or scoring decision that Jev/Kev can solve in <100ms.",
+                    "tier_0_deterministic": "Can be completely solved with deterministic code: regex, datetime, os/path, jq, git, or bash pipe ($0.00 API cost, no model roundtrip).",
+                    "tier_05_decision": "Is a classification, boolean check, filtering, or scoring decision that a fast non-autoregressive model (Jev/Kev) can answer.",
                     "tier_frontier_generative": "Legitimately requires open-ended creative text generation, complex code writing, or multi-turn reasoning."
                 }
             },
@@ -403,11 +470,13 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_
     if model is not None:
         extra_kwargs["model"] = model
 
+    fallback_info = {}
     data, provider_name = call_decision_endpoint(
         payload,
         use_kev=use_kev,
         env_file=env_file,
         allow_fallback=allow_fallback,
+        fallback_info=fallback_info,
         **extra_kwargs
     )
     lat_ms = round((time.time() - t0) * 1000, 1)
@@ -431,5 +500,7 @@ def evaluate_with_jev(finding, file_content, use_kev=False, env_file=None, base_
         "confidence": round(confidence, 2),
         "deterministic_prob": round(det_prob, 2),
         "actionability_score": action_score,
-        "latency_ms": lat_ms
+        "latency_ms": lat_ms,
+        "fallback_used": bool(fallback_info.get("used")),
+        "fallback": dict(fallback_info) if fallback_info.get("used") else None,
     }

@@ -8,12 +8,12 @@ import re
 import sys
 import stat
 import errno
-import concurrent.futures
 from pathlib import Path
 from .patterns import PATTERNS, CUE_PATTERNS, LLM_CONTEXT_GATE
 from .jev_evaluator import evaluate_with_jev
 from .deep_scanner import deep_scan_file
 from .ast_scanner import scan_python_ast
+from .concurrency import bounded_parallel_map
 
 GATE_PREFILTER_RE = re.compile(LLM_CONTEXT_GATE, re.IGNORECASE)
 
@@ -31,7 +31,7 @@ MAX_FILE_BYTES = 1_000_000  # 1,000,000 byte cap prevents memory exhaustion on m
 # Batch budget: bound how much work one scan pass does before reporting progress.
 # Bytes, not file count, because bytes are what bound wall-clock time.
 # Default on, so a large tree is observable without the caller knowing the flag exists.
-DEFAULT_BATCH_BYTES = 50_000_000  # 50 MiB per batch
+DEFAULT_BATCH_BYTES = 50_000_000  # 50,000,000 bytes (~47.7 MiB) per batch; --batch-mb is exact MiB
 MIN_BATCH_BYTES = 1_000_000        # never let a caller set a batch below one file cap
 
 def read_source_file_safe(file_path: str, stats: dict = None) -> str:
@@ -298,7 +298,7 @@ def _batches(files, batch_bytes):
 
 
 def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=False,
-              base_url=None, api_key=None, model=None, allow_fallback=False):
+              base_url=None, api_key=None, model=None, allow_fallback=False, workers=5):
     """Scans a single file. Returns (counted_bool, findings)."""
     content = read_source_file_safe(fpath, stats)
     if not content:
@@ -316,13 +316,13 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
             return item, v
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(findings))) as executor:
-                futures = [executor.submit(_eval_item, item) for item in findings]
-                for fut in concurrent.futures.as_completed(futures):
-                    item, verdict = fut.result()
-                    if verdict:
-                        item["jev_eval"] = verdict
-                        stats["invoked"] = True
+            for item, verdict in bounded_parallel_map(_eval_item, findings, workers):
+                if verdict:
+                    item["jev_eval"] = verdict
+                    stats["invoked"] = True
+                    if verdict.get("fallback_used"):
+                        stats["fallback_used"] = True
+                        stats["fallback"] = dict(verdict.get("fallback") or {})
         except Exception as e:
             raise RuntimeError(f"decision engine failed closed: {e}") from e
 
@@ -333,7 +333,7 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
             deep_findings = deep_scan_file(
                 fpath, content, use_kev=use_kev, env_file=env_file, stats=stats, debug=deep_debug,
                 base_url=base_url, api_key=api_key, model=model, allow_fallback=allow_fallback,
-                allowed=allowed, record_exemption_fn=_record_exemption
+                allowed=allowed, record_exemption_fn=_record_exemption, workers=workers
             )
         except Exception as e:
             raise RuntimeError(f"deep scan failed closed for {fpath}: {e}") from e
@@ -346,23 +346,29 @@ def _scan_one(fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug=Fa
 def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_file=None,
                  batch_bytes=DEFAULT_BATCH_BYTES, progress=True, deep_debug=False,
                  base_url=None, api_key=None, model=None, include_docs=False,
-                 allow_fallback=False):
+                 allow_fallback=False, workers=5):
     """Scans target paths, partitioned into byte-budgeted batches.
 
     A large tree is split so that progress is observable and a timeout costs one
     batch rather than the whole sweep. Findings accumulate across all batches, so
     the return value is identical whether or not batching occurs.
 
+    batch_bytes=None means "use DEFAULT_BATCH_BYTES" (50,000,000 bytes, about 47.7 MiB);
+    explicit values below MIN_BATCH_BYTES are raised to the one-file-cap floor, never lowered.
+    workers bounds decision-engine submissions (1..32, enforced at the CLI).
+
     Returns (scanned_count, all_findings, stats) where stats tracks skipped files
     and whether any decision-engine call actually returned.
     """
-    if batch_bytes is None or batch_bytes < MIN_BATCH_BYTES:
+    if batch_bytes is None:
+        batch_bytes = DEFAULT_BATCH_BYTES
+    if batch_bytes < MIN_BATCH_BYTES:
         batch_bytes = MIN_BATCH_BYTES
 
     EXEMPTIONS.clear()
     all_findings = []
     scanned_files = 0
-    stats = {"skipped": 0, "invoked": False}
+    stats = {"skipped": 0, "invoked": False, "fallback_used": False, "fallback": None}
 
     enumerated = list(_iter_target_files(targets, include_docs=include_docs))
     batches = list(_batches(enumerated, batch_bytes))
@@ -380,7 +386,7 @@ def scan_targets(targets, use_jev=False, use_kev=False, deep_scan=False, env_fil
             counted, findings = _scan_one(
                 fpath, use_jev, use_kev, deep_scan, env_file, stats, deep_debug,
                 base_url=base_url, api_key=api_key, model=model,
-                allow_fallback=allow_fallback
+                allow_fallback=allow_fallback, workers=workers
             )
             if counted:
                 scanned_files += 1

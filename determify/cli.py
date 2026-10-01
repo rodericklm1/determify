@@ -7,7 +7,7 @@ import json
 import argparse
 from pathlib import Path
 from .scanner import scan_targets, EXEMPTIONS
-from .jev_evaluator import resolve_decision_config, get_kev_url, DEFAULT_TYPESAFE_URL, OPENROUTER_DECISIONS_URL, get_api_key
+from .jev_evaluator import resolve_decision_config, DEFAULT_TYPESAFE_URL, OPENROUTER_DECISIONS_URL, get_api_key
 from . import __version__
 
 def main():
@@ -24,7 +24,7 @@ def _run_cli():
     )
     parser.add_argument("path", nargs="*", default=["."], help="Files or directories to scan (default: current directory). Use '--' before paths starting with a dash.")
     parser.add_argument("--jev", action="store_true", help="Use TypeSafe Jev (TypeSafe official, OpenRouter, or custom endpoint) for intelligent semantic triage")
-    parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for sub-90ms local triage")
+    parser.add_argument("--kev", action="store_true", help="Use on-prem Kev-0.6B (default: http://localhost:8009/v1/systemone) for local triage")
     parser.add_argument("--base-url", "--endpoint", default=None, help="Custom Jev decision API endpoint URL (e.g. 'https://api.typesafe.ai/v1/systemone', 'https://openrouter.ai/api/alpha/decisions', or an internal proxy). Overrides JEV_BASE_URL.")
     parser.add_argument("--api-key", "--key", default=None, help="API key for Jev decision provider. Overrides JEV_API_KEY, TYPESAFE_API_KEY, and OPENROUTER_API_KEY.")
     parser.add_argument("--model", default=None, help="Decision model identifier (defaults to 'jev-latest' for TypeSafe/custom or '~typesafe/jev-latest' for OpenRouter).")
@@ -32,8 +32,13 @@ def _run_cli():
     parser.add_argument("--deep-debug", action="store_true", help="Log chunks the deep classifier evaluated but dropped to stderr (use with --deep)")
     parser.add_argument("--env-file", default=None, help="Explicit path to .env file containing API key and endpoint configuration")
     parser.add_argument("--batch-mb", type=int, default=None,
-                        help="Split large trees into batches of this many MiB, reporting progress to stderr. "
-                             "Default 50. Batching never changes the findings, only how much work happens per step.")
+                        help="Split large trees into batches of this many MiB (1 MiB = 1,048,576 bytes), "
+                             "reporting progress to stderr. Default when omitted: the scanner's "
+                             "DEFAULT_BATCH_BYTES, 50,000,000 bytes (about 47.7 MiB); explicit --batch-mb N "
+                             "requests exactly N MiB and never silently changes that cap otherwise. "
+                             "Batching never changes the findings, only how much work happens per step.")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Max concurrent decision-engine submissions per file (1-32).")
     parser.add_argument("--include-docs", action="store_true", help="Include markdown documentation (.md, .markdown) in scan")
     parser.add_argument("--allow-fallback", action="store_true", help="Permit automatic fallback to local Kev if cloud Jev is unreachable or unconfigured")
     parser.add_argument("--no-progress", action="store_true", help="Suppress per-batch progress on stderr")
@@ -42,6 +47,16 @@ def _run_cli():
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
+    # Workers must be a positive, bounded count: 0 or negative would deadlock the
+    # executor, and unbounded counts invite provider rate limits the cap exists to avoid.
+    if args.workers < 1 or args.workers > 32:
+        sys.stderr.write(f"Error: --workers must be between 1 and 32, got {args.workers}\n")
+        sys.exit(2)
+
+    if args.batch_mb is not None and args.batch_mb < 1:
+        sys.stderr.write(f"Error: --batch-mb must be at least 1 MiB, got {args.batch_mb}\n")
+        sys.exit(2)
 
     # Convenience: passing --base-url or --api-key implies --jev triage unless --kev is requested
     if (args.base_url or args.api_key or args.model) and not args.kev:
@@ -87,7 +102,7 @@ def _run_cli():
             use_kev=args.kev,
             deep_scan=args.deep,
             env_file=args.env_file,
-            batch_bytes=(args.batch_mb * 1_048_576) if args.batch_mb else None,
+            batch_bytes=(args.batch_mb * 1_048_576) if args.batch_mb is not None else None,
             progress=not args.no_progress,
             deep_debug=args.deep_debug,
             base_url=args.base_url,
@@ -95,6 +110,7 @@ def _run_cli():
             model=args.model,
             include_docs=args.include_docs,
             allow_fallback=args.allow_fallback,
+            workers=args.workers,
         )
     except Exception as e:
         # Fail closed: stderr + exit 2, and do not print a clean or success report.
@@ -114,7 +130,19 @@ def _run_cli():
         )
         dest = cfg["base_url"]
         model_label = f" (model: {cfg['model']})" if cfg.get("model") else ""
-        print(f"[*] Decision Engine Active: Triage queries were evaluated by {dest}{model_label}")
+        fb = stats.get("fallback") or {}
+        if stats.get("fallback_used") and fb.get("used"):
+            # Structured evaluator metadata: exact reasons, exact destinations.
+            if fb.get("reason") == "no_cloud_key":
+                print(f"[*] Explicit fallback used: primary endpoint {fb.get('primary_url', dest)} was "
+                      f"not contacted (no cloud API key); --allow-fallback triage was answered by "
+                      f"Kev at {fb.get('fallback_url')}")
+            else:
+                print(f"[*] Explicit fallback used: primary endpoint {fb.get('primary_url', dest)} hit a "
+                      f"transient availability error; explicit --allow-fallback triage was answered by "
+                      f"Kev at {fb.get('fallback_url')}")
+        else:
+            print(f"[*] Decision Engine Active: Triage queries were evaluated by {dest}{model_label}")
 
     # Format findings with relative paths for both JSON and terminal
     cwd = Path.cwd().resolve()

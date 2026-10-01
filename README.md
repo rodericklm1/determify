@@ -1,6 +1,8 @@
 # ⚡ determify
 
 > **"Never use an LLM if a 3-line Bash script solves it for zero tokens, zero latency, and zero hallucinations."**
+>
+> *Design maxim and routing heuristic, not a benchmark guarantee: deterministic scripts still consume real CPU, memory, and maintenance time.*
 
 `determify` is a standalone static scanner for agentic codebases. It finds the places where your code hands an LLM a job that plain code can finish faster, cheaper, and without hallucinating.
 
@@ -8,7 +10,7 @@
 > You do not need an API key, an LLM, or TypeSafe Jev to run `determify`.  
 > It scans offline by default and installs with no external dependencies. Point it at Jev or a local Kev and it adds semantic triage on top of the static findings.
 
-Inspired by **[jevify](https://github.com/altryne/jevify)**, `determify` audits code, agent tool definitions, and automation scripts for calls that ask a generative model (Claude, GPT, Gemini) to do work standard code finishes in 2ms for $0.00.
+Inspired by **[jevify](https://github.com/altryne/jevify)**, `determify` audits code, agent tool definitions, and automation scripts for calls that ask a generative model (Claude, GPT, Gemini) to do work standard code finishes deterministically for $0.00 in API cost.
 
 ---
 
@@ -20,14 +22,14 @@ Every task in an agentic pipeline belongs to one of three tiers:
 %%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '13px' }}}%%
 flowchart TD
     Task([Incoming Task / Operation]) --> T0{Can it be solved with math, regex, or system calls?}
-    T0 -- Yes --> Tier0[Tier 0: Pure Determinism\nPOSIX Bash / Python stdlib\n$0.00 • <5ms local latency • Zero model hallucination]
+    T0 -- Yes --> Tier0[Tier 0: Pure Determinism\nPOSIX Bash / Python stdlib\n$0.00 API cost • No model roundtrip]
     T0 -- No --> T05{Is it a categorical choice, filtering, or scoring judgment?}
-    T05 -- Yes --> Tier05[Tier 0.5: Fast Decision Model\nTypeSafe Jev / On-Prem Kev-0.6B\nSub-cent • <100ms non-autoregressive]
+    T05 -- Yes --> Tier05[Tier 0.5: Fast Decision Model\nTypeSafe Jev / On-Prem Kev-0.6B\nOperator-metered • Non-autoregressive]
     T05 -- No --> TierFrontier[Tier 2+: Generative Frontier LLM\nFrontier models\nMetered per token • Multi-second generation]
 ```
 
 - **Tier 0. Pure deterministic code.** File checks, JSON extraction, relative timestamps, regex cleaning, line counts. Standard code handles all of it with zero model hallucinations (standard software correctness and tests still apply).
-- **Tier 0.5. Non-autoregressive decision models** (TypeSafe Jev, Kev-0.6B). Fast categorization, routing, intent gating, rubric scoring, relevance filtering. Answers in under 100ms with zero output tokens.
+- **Tier 0.5. Non-autoregressive decision models** (TypeSafe Jev, Kev-0.6B). Fast categorization, routing, intent gating, rubric scoring, relevance filtering. Answers with zero output tokens; latency depends on the operator's hardware and deployment.
 - **Tier 2+. Generative frontier LLMs.** Open-ended generation, creative writing, synthesis, multi-hop reasoning. Reserved strictly for tasks that require deep cognitive synthesis.
 
 ---
@@ -49,7 +51,7 @@ flowchart TD
 
 ## 🤖 Point Your AI at Determify (Universal Agent Skill)
 
-You don't need to configure Determify, remember rule IDs, or learn CLI flags. You can point any AI coding assistant (**Claude Code**, **Cursor**, **OpenCode**, **Codex**, **Hermes**, **Roo Code**, or any agent) directly at this repository to audit and optimize your code:
+You don't need to configure Determify, remember rule IDs, or learn CLI flags. You can point any AI coding assistant (**Claude Code**, **Cursor**, **OpenCode**, **Codex**, **Hermes**, **Roo Code**, or any harness that loads `SKILL.md` files) directly at this repository to audit and optimize your code:
 
 ### Direct Agent Prompt
 Tell your AI assistant in any project:
@@ -79,7 +81,7 @@ pip install -e .
 
 ### 1. Standalone static scan (no API key, no setup)
 
-Scan any file or directory. `determify` runs offline and needs no configuration. (Directory sweeps automatically ignore `.git/`, `node_modules/`, `venv/`, and `tests/` directories by default to focus on application code).
+Scan any file or directory. `determify` runs offline and needs no configuration. (Directory sweeps automatically ignore `.git/`, `node_modules/`, `venv/`, and `tests/` directories by default to focus on application code, and skip Markdown prose unless `--include-docs` is set. Coverage is therefore partial: findings are candidates from the documented rule set, not a proof of absence.)
 
 ```bash
 # Scan current directory
@@ -98,11 +100,11 @@ determify ./src
 Two options are available:
 
 1. **Cloud / Managed API.** [TypeSafe Jev](https://docs.typesafe.ai) via TypeSafe's official System One API (`https://api.typesafe.ai/v1/systemone`), OpenRouter's Decisions API (`https://openrouter.ai/api/alpha/decisions`), or any custom endpoint/proxy.
-2. **Local or self-hosted.** **[Kev](https://github.com/jaredpalmer/kev).** Jared Palmer's open-weights 0.6B non-autoregressive decision model. It is fully API-compatible with TypeSafe System One, self-hosts on your own GPU or CPU for zero API fees, and returns a decision in under 90ms.
+2. **Local or self-hosted.** **[Kev](https://github.com/jaredpalmer/kev).** Jared Palmer's open-weights 0.6B non-autoregressive decision model. It is fully API-compatible with TypeSafe System One, self-hosts on your own GPU or CPU for zero API fees and answers locally; latency depends on your hardware.
 
 #### 2. Intelligent triage with TypeSafe Jev (`--jev`)
 
-Pass suspicious call sites directly to TypeSafe Jev. In under 100ms, Jev evaluates the surrounding code and classifies whether it is truly deterministic, a decision candidate, or legitimately generative.
+Pass suspicious call sites directly to TypeSafe Jev, which evaluates the surrounding code and classifies whether it is truly deterministic, a decision candidate, or legitimately generative.
 
 You are never locked into a single provider:
 
@@ -119,9 +121,9 @@ determify ./src --jev
 determify ./src --base-url https://api.mycompany.ai/v1/systemone --api-key "$MY_KEY"
 ```
 
-#### 3. On-premises air-gapped triage with Kev-0.6B (`--kev`)
+#### 3. On-premises local triage with Kev-0.6B (`--kev`)
 
-For complete privacy, zero API costs, or offline air-gapped execution, deploy **[jaredpalmer/kev](https://github.com/jaredpalmer/kev)** locally. `determify` talks directly to Kev's `/v1/systemone` endpoint.
+For self-hosted execution and zero API costs, deploy **[jaredpalmer/kev](https://github.com/jaredpalmer/kev)** locally. `determify` talks directly to Kev's `/v1/systemone` endpoint. Requests target the configured endpoint; data leaves the host only if that endpoint forwards it, so the localhost isolation is a property of *your* deployment, not a built-in air gap.
 
 ```bash
 # Point to your local or LAN Kev server (default: http://localhost:8009/v1/systemone)
@@ -172,8 +174,8 @@ flowchart LR
 
     subgraph TIERS["Execution Tiers"]
         direction TB
-        T0["🟢 Tier 0: Pure Code\nPOSIX / Python stdlib\nSub-millisecond • Cost: $0.00"]
-        T05["⚡ Tier 0.5: Decision Models\nTypeSafe Jev / Kev-0.6B\nSub-100ms • Fractions of a cent"]
+        T0["🟢 Tier 0: Pure Code\nPOSIX / Python stdlib\nDeterministic • $0.00 API cost"]
+        T05["⚡ Tier 0.5: Decision Models\nTypeSafe Jev / Kev-0.6B\nNon-autoregressive • Operator-metered"]
         T2["🟣 Tier 2+: Generative LLMs\nFrontier models\nMulti-second • Only when synthesis needed"]
     end
 

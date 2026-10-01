@@ -41,7 +41,7 @@ PATTERNS = [
         "description": "Prompting an LLM for current date, relative dates, or timezone calculations.",
         "regex": _cue(CUE_RAW["DET-01"]),
         "fix": "Use datetime.now(), datetime.timedelta, moment/dayjs, or POSIX 'date -d' / 'date +%Y-%m-%d'",
-        "savings": "100% token elimination ($0.00), sub-millisecond local execution"
+        "savings": "Token elimination for this call ($0.00 API cost); local stdlib execution"
     },
     {
         "id": "DET-02",
@@ -49,7 +49,7 @@ PATTERNS = [
         "description": "Using an LLM to check if a file exists, count files in a directory, or resolve file paths.",
         "regex": _cue(CUE_RAW["DET-02"]),
         "fix": "Use os.path.exists(), pathlib.Path, glob.glob(), or POSIX 'find' / 'test -f'",
-        "savings": "100% token elimination ($0.00), zero network latency"
+        "savings": "Token elimination for this call ($0.00 API cost); local filesystem check"
     },
     {
         "id": "DET-03",
@@ -65,7 +65,7 @@ PATTERNS = [
         "description": "Prompting an LLM to determine PDF page counts or classify document size.",
         "regex": _cue(CUE_RAW["DET-04"]),
         "fix": "Use 'pdfinfo <file.pdf>', pypdf, pdfjs, or os.path.getsize",
-        "savings": "Instant execution, deterministic page count"
+        "savings": "Deterministic local page count for $0.00 API cost"
     },
     {
         "id": "DET-05",
@@ -81,7 +81,7 @@ PATTERNS = [
         "description": "Using an LLM to check for literal keyword presence or category membership when exact keywords suffice.",
         "regex": _cue(CUE_RAW["DET-06"]),
         "fix": "Use Python 'in' operator, regex word boundaries, or 'grep -E'",
-        "savings": "Instant execution, literal membership check"
+        "savings": "In-process literal membership check for $0.00 API cost"
     },
     {
         "id": "DET-07",
@@ -91,6 +91,6 @@ PATTERNS = [
             r"""(?i)(?:openai\.(?:chat\.)?completions\.create|anthropic\.messages\.create|client\.chat\.completions|client\.messages\.create|client\.responses\.create|llm\.complete\b|model\.generate_content|ChatOpenAI\(|ChatAnthropic\(|opencode\s+run|hermes\s+run|claude\s+-p|sgpt\s+-[soec])"""
         ),
         "fix": "If call requires open-ended synthesis, retain and annotate with '# determify:allow DET-07 <reason>'. If deterministic or a decision, add upstream gate.",
-        "savings": "If replaceable: sub-100ms latency vs 3-10s; 95-100% cost reduction"
+        "savings": "If replaceable: removes metered token spend and the network roundtrip on this call"
     }
 ]

@@ -1091,12 +1091,13 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
         self.assertIn("DET-07", ids, f"Expected DET-07 for chat.completions.create, got {ids}")
 
     def test_det_deep_allow_marker_exempts_finding(self):
-        """# determify:allow DET-DEEP reason properly suppresses semantic deep-scan findings."""
+        """# determify:allow DET-DEEP reason properly suppresses semantic deep-scan findings
+        when it binds the finding's exact signal site (marker directly above it)."""
         from determify.deep_scanner import deep_scan_file
         from determify.scanner import parse_allow_markers, _record_exemption, EXEMPTIONS
         EXEMPTIONS.clear()
 
-        def mock(payload, use_kev=False, env_file=None, **kwargs):
+        def mock(payload, use_kev=False, env_file=None):
             return {
                 "answers": {
                     "contains_unnecessary_ai": {"noul": 0.95},
@@ -1105,8 +1106,8 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
             }, "mock"
 
         content = (
-            "# determify:allow DET-DEEP Authorized semantic workflow\n"
             "def run_ai():\n"
+            "    # determify:allow DET-DEEP Authorized semantic workflow\n"
             "    llm = client.messages.create(model='m', messages=[])\n"
         )
         lines = content.splitlines()
@@ -1119,6 +1120,7 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
         self.assertEqual(len(findings), 0, "DET-DEEP should be exempted")
         self.assertEqual(len(EXEMPTIONS), 1, "Exemption must be recorded in ledger")
         self.assertEqual(EXEMPTIONS[0]["id"], "DET-DEEP")
+        self.assertEqual(EXEMPTIONS[0]["line"], 3, "exemption ownership recorded at the exact signal site")
         self.assertEqual(EXEMPTIONS[0]["reason"], "Authorized semantic workflow")
 
     def test_cli_allow_fallback_without_api_key(self):
@@ -1190,6 +1192,987 @@ class TestReviewerBoundaryChecklist(unittest.TestCase):
         findings, _ = self._scan(content)
         ids = [f["id"] for f in findings]
         self.assertEqual(ids, ["DET-07"], f"Expected only DET-07, got {ids}")
+
+
+class TestWorkOrderASTRegressions(unittest.TestCase):
+    """Snippets confirmed defective in the review, plus sibling control-flow cases."""
+
+    def _scan(self, content: str):
+        from determify.scanner import EXEMPTIONS
+        EXEMPTIONS.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        return [x["id"] for x in findings]
+
+    def test_walrus_dynamic_rebind_before_arg_extraction(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'client.responses.create(input=(question:=fetch()))\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"Stale walrus binding leaked: {ids}")
+        self.assertEqual(ids.count("DET-07"), 2)
+
+    def test_walrus_literal_still_resolves(self):
+        content = (
+            'client.responses.create(input=(question:="What is today\'s date?"))\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertIn("DET-01", ids, "Literal walrus binding must remain resolvable")
+        self.assertEqual(ids.count("DET-07"), 2)
+
+    def test_tuple_destructuring_invalidates_all_targets(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'other = "also a date? what time is it"\n'
+            'question, other = fetch()\n'
+            'client.responses.create(input=question)\n'
+            'client.responses.create(input=other)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"Tuple unpack left stale bindings: {ids}")
+
+    def test_list_destructuring_invalidates_all_targets(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            '[question] = fetch()\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"List unpack left stale binding: {ids}")
+
+    def test_if_else_branch_isolation_no_leak_into_else(self):
+        content = (
+            'if flag:\n'
+            '    question = "What is today\'s date?"\n'
+            'else:\n'
+            '    client.responses.create(input=question)\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"If-branch assignment leaked across/after branches: {ids}")
+        self.assertEqual(ids.count("DET-07"), 2)
+
+    def test_class_body_resolves_current_class_bindings(self):
+        content = (
+            'class Example:\n'
+            '    question = "What is today\'s date?"\n'
+            '    client.responses.create(input=question)\n'
+            '    def run(self):\n'
+            '        return client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertEqual(ids.count("DET-01"), 1, "Class-body call must resolve the class literal once")
+        self.assertEqual(ids.count("DET-07"), 2)
+
+    def test_while_body_writes_invalidated_after_block(self):
+        content = (
+            'while cond:\n'
+            '    question = "What is today\'s date?"\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"Loop-body write leaked past the loop: {ids}")
+
+    def test_try_handler_isolation(self):
+        content = (
+            'try:\n'
+            '    question = "What is today\'s date?"\n'
+            '    boom()\n'
+            'except Exception:\n'
+            '    client.responses.create(input=question)\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, f"Try-body write leaked into handler/post-try: {ids}")
+
+    def test_except_as_name_invalidated(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'try:\n'
+            '    pass\n'
+            'except Exception as question:\n'
+            '    client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "except-as must mask the prior literal binding")
+
+    def test_match_capture_and_case_isolation(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'match data:\n'
+            '    case {"prompt_text": question}:\n'
+            '        client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "Pattern capture must invalidate the outer literal")
+
+    def test_match_case_writes_invalidated_after(self):
+        content = (
+            'match command:\n'
+            '    case "go":\n'
+            '        question = "What is today\'s date?"\n'
+            '    case other:\n'
+            '        pass\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "Case-body write leaked past the match")
+
+    def test_with_as_target_invalidates_binding(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'with open(path) as question:\n'
+            '    client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "with-as rebind must mask the prior literal")
+
+    def test_with_body_write_invalidated_after(self):
+        content = (
+            'with open(path) as fh:\n'
+            '    question = "What is today\'s date?"\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "with-body write must not be assumed to complete")
+
+    def test_delete_invalidates_binding(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'del question\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "del must invalidate the binding")
+
+    def test_global_declaration_masks_module_literal(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'def f():\n'
+            '    global question\n'
+            '    question = fetch()\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "global rebind must conservatively mask the module literal")
+
+    def test_def_statement_name_masks_prior_literal(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'def question():\n'
+            '    pass\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "def rebinds the name; old literal is not proof")
+
+    def test_import_alias_masks_prior_literal(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'import json as question\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        self.assertNotIn("DET-01", ids, "import binding must mask the prior literal")
+
+
+def _make_decision_server(policy, label="srv"):
+    """
+    Start a localhost decision server. policy: dict with
+    mode=json (200 + answers), status=(code), garbage, or redirect.
+    Returns (server, port, requests_list) where requests_list accumulates
+    {"auth": header, "body": parsed-or-raw} entries per ACTUAL received request.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    answers = {
+        "answers": {
+            "optimal_tier": {"choice": "tier_0_deterministic", "confidence": 0.9},
+            "can_be_deterministic": {"noul": 0.9},
+            "actionability_score": {"score": 2.5},
+            "contains_unnecessary_ai": {"noul": 0.9},
+            "replacement_tier": {"choice": "clean_tier_0_code", "confidence": 0.9},
+        }
+    }
+    requests_list = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                parsed = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                parsed = raw
+            requests_list.append({"auth": self.headers.get("Authorization"), "body": parsed})
+            mode = policy.get("mode", "json")
+            if mode == "redirect":
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/steal")
+                self.end_headers()
+                return
+            if mode == "garbage":
+                body = b"{not valid json at all"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            status = policy.get("code", 200) if mode == "status" else 200
+            body = json.dumps(answers).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], requests_list
+
+
+class TestEvaluatorTypedFallbackE2E(unittest.TestCase):
+    """Fallback only on typed availability errors, proven against live localhost servers."""
+
+    def _cli(self, args, extra_env=None):
+        cmd = [sys.executable, "-m", "determify.cli", *args]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parent.parent)
+        for k in ("OPENROUTER_API_KEY", "JEV_API_KEY", "TYPESAFE_API_KEY",
+                  "JEV_BASE_URL", "JEV_ENDPOINT", "TYPESAFE_BASE_URL",
+                  "OPENROUTER_DECISIONS_URL", "JEV_MODEL", "KEV_ENDPOINT"):
+            env.pop(k, None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+
+    def _finding_file(self, td):
+        target = Path(td) / "app.py"
+        target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+        return str(target)
+
+    def test_post_json_typed_classification(self):
+        import urllib.error
+        from determify.jev_evaluator import (
+            _post_json, AvailabilityError, PermanentServiceError, ResponseFormatError,
+        )
+        servers = []
+        try:
+            for mode_args in (("status", 503), ("status", 403), ("garbage", None)):
+                srv, port, _ = _make_decision_server(
+                    {"mode": mode_args[0], "code": mode_args[1] or 200})
+                servers.append(srv)
+                url = f"http://127.0.0.1:{port}/v1/systemone"
+                if mode_args[0] == "status" and mode_args[1] == 503:
+                    ctx = self.assertRaises(AvailabilityError)
+                elif mode_args[0] == "status":
+                    ctx = self.assertRaises(PermanentServiceError)
+                else:
+                    ctx = self.assertRaises(ResponseFormatError)
+                with ctx as cm:
+                    _post_json(url, {"model": "m"}, {})
+                self.assertIsNotNone(cm.exception.__cause__, "cause must be preserved")
+            # Dead port -> AvailabilityError (connection class)
+            ctx = self.assertRaises(AvailabilityError)
+            with ctx as cm:
+                _post_json("http://127.0.0.1:1/v1/systemone", {"model": "m"}, {}, timeout=2)
+            self.assertIsInstance(cm.exception.__cause__, (urllib.error.URLError, OSError))
+        finally:
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_error_paths_close_httperror_without_resourcewarning(self):
+        """Bounded error-body reads must close HTTPError explicitly; GC-time
+        implicit cleanup surfaces ResourceWarnings under dev mode."""
+        import gc
+        import warnings
+        from determify.jev_evaluator import _post_json, AvailabilityError, PermanentServiceError
+        servers = []
+        try:
+            srv5, p5, _ = _make_decision_server({"mode": "status", "code": 503})
+            srv4, p4, _ = _make_decision_server({"mode": "status", "code": 403})
+            servers += [srv5, srv4]
+            for port, exc in ((p5, AvailabilityError), (p4, PermanentServiceError)):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", ResourceWarning)
+                    with self.assertRaises(exc):
+                        _post_json(f"http://127.0.0.1:{port}/v1/systemone", {"model": "m"}, {}, timeout=4)
+                gc.collect()  # any unclosed response would warn here as an error
+        finally:
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_429_falls_back_and_discloses_both_destinations(self):
+        prim, pport, preqs = _make_decision_server({"mode": "status", "code": 429})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                res = self._cli(
+                    ["--jev", "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "PRIMARY-CLI-SECRET", "--allow-fallback", "--no-progress",
+                     self._finding_file(td)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(len(preqs), 1, "primary got exactly one real request")
+            self.assertEqual(len(kreqs), 1, "fallback kev got exactly one real request")
+            for req in kreqs:
+                self.assertNotEqual(req["auth"], "Bearer PRIMARY-CLI-SECRET",
+                                    "primary CLI credential leaked into fallback headers")
+            self.assertIn("falling back to authorized Kev at", res.stderr)
+            self.assertIn(f"http://127.0.0.1:{pport}", res.stderr)
+            self.assertIn("explicit --allow-fallback", res.stdout)
+            self.assertIn(f"http://127.0.0.1:{kport}", res.stdout)
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+    def test_no_fallback_flag_503_fails_closed(self):
+        prim, pport, _ = _make_decision_server({"mode": "status", "code": 503})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                res = self._cli(
+                    ["--jev", "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "k", "--no-progress", self._finding_file(td)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("failed closed", res.stderr)
+            self.assertEqual(len(kreqs), 0, "no fallback without the explicit flag")
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+    def test_auth_and_format_and_security_errors_never_fall_back(self):
+        cases = [
+            ("auth 401", {"mode": "status", "code": 401}),
+            ("forbidden 403", {"mode": "status", "code": 403}),
+            ("malformed json", {"mode": "garbage"}),
+            ("redirect security", {"mode": "redirect"}),
+        ]
+        for name, policy in cases:
+            with self.subTest(name):
+                prim, pport, _ = _make_decision_server(policy)
+                kev, kport, kreqs = _make_decision_server({"mode": "json"})
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        res = self._cli(
+                            ["--jev", "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                             "--api-key", "k", "--allow-fallback", "--no-progress",
+                             self._finding_file(td)],
+                            {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                        )
+                    self.assertEqual(res.returncode, 2, res.stdout)
+                    self.assertEqual(len(kreqs), 0, f"{name} must not trigger fallback")
+                finally:
+                    prim.shutdown(); prim.server_close()
+                    kev.shutdown(); kev.server_close()
+
+    def test_missing_key_with_fallback_calls_kev_only(self):
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                res = self._cli(
+                    ["--jev", "--allow-fallback", "--no-progress", self._finding_file(td)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(len(kreqs), 1)
+            self.assertIn("falling back to authorized Kev at", res.stderr)
+        finally:
+            kev.shutdown(); kev.server_close()
+
+    def test_deep_end_to_end_fallback_and_fail_closed(self):
+        from determify.deep_scanner import deep_scan_file
+        # deep path: transient primary failure + flag => fallback answers
+        prim, pport, preqs = _make_decision_server({"mode": "status", "code": 503})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "deep_app.py"
+                target.write_text('llm = client.messages.create(model="m", messages=[])\n')
+                res = self._cli(
+                    ["--deep", "--jev",
+                     "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "k", "--allow-fallback", "--no-progress", "--json", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            data = json.loads(res.stdout)
+            ids = [f["id"] for f in data["findings"]]
+            self.assertIn("DET-DEEP", ids)
+            self.assertTrue(any("fallback" in str(f.get("jev_eval", {}).get("provider", ""))
+                                for f in data["findings"]))
+            self.assertGreaterEqual(len(preqs), 1)
+            self.assertGreaterEqual(len(kreqs), 1)
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+    def test_deep_malformed_json_fails_closed_no_fallback(self):
+        prim, pport, _ = _make_decision_server({"mode": "garbage"})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "deep_app.py"
+                target.write_text('llm = client.messages.create(model="m", messages=[])\n')
+                res = self._cli(
+                    ["--deep", "--jev",
+                     "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "k", "--allow-fallback", "--no-progress", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("failed closed", res.stderr)
+            self.assertEqual(len(kreqs), 0)
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+
+class TestDeepExemptionExactSite(unittest.TestCase):
+    """One marker must never suppress an unrelated chunk site inside the same window."""
+
+    def test_two_unrelated_sites_same_window(self):
+        from determify.deep_scanner import deep_scan_file
+        from determify.scanner import parse_allow_markers, _record_exemption, EXEMPTIONS
+        EXEMPTIONS.clear()
+
+        calls = []
+        def mock(payload, use_kev=False, env_file=None):
+            calls.append(1)
+            return {
+                "answers": {
+                    "contains_unnecessary_ai": {"noul": 0.9},
+                    "replacement_tier": {"choice": "clean_tier_0_code", "confidence": 0.9},
+                }
+            }, "mock"
+
+        lines = ["x%d = %d" % (i, i) for i in range(1, 121)]
+        lines[4] = "client.responses.create(model='m', input='sort names')"     # site A line 5
+        lines[48] = "# determify:allow DET-DEEP Only the second site is reviewed"
+        lines[49] = "llm = client.messages.create(model='m', messages=[])"       # site B line 50
+        content = "\n".join(lines) + "\n"
+        allowed = parse_allow_markers(content.splitlines())
+
+        with patch("determify.deep_scanner.call_decision_endpoint", mock):
+            findings = deep_scan_file(
+                "two_sites.py", content, use_kev=True, allowed=allowed,
+                record_exemption_fn=_record_exemption,
+            )
+        reported = [f["line"] for f in findings]
+        self.assertEqual(reported, [5], "marker at site B must not suppress the unrelated site A")
+        self.assertEqual(len(EXEMPTIONS), 1)
+        self.assertEqual(EXEMPTIONS[0]["line"], 50, "exemption recorded at the owning signal site")
+        self.assertEqual(len(calls), 2, "both sites evaluated; suppression is post-evaluation, exact-site")
+
+
+class TestConcurrencyBoundedSubmissions(unittest.TestCase):
+    """Overlap, bounds, ordering, and cancellation via events (no brittle timing)."""
+
+    def test_overlap_proven_by_barrier_and_input_order(self):
+        import threading
+        from determify.concurrency import bounded_parallel_map
+        barrier = threading.Barrier(3, timeout=10)
+
+        def fn(i):
+            if i < 3:
+                barrier.wait()  # completes only if three tasks truly overlap
+            return i * 10
+
+        results = bounded_parallel_map(fn, range(6), max_workers=3)
+        self.assertEqual(results, [0, 10, 20, 30, 40, 50], "results must follow input order")
+
+    def test_pending_submissions_bounded_by_workers(self):
+        import threading
+        from determify.concurrency import bounded_parallel_map
+        lock = threading.Lock()
+        active = [0]
+        peak = [0]
+
+        def fn(i):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            ev = threading.Event()
+            ev.wait(0.01)
+            with lock:
+                active[0] -= 1
+            return i
+
+        results = bounded_parallel_map(fn, range(20), max_workers=4)
+        self.assertEqual(results, list(range(20)))
+        self.assertLessEqual(peak[0], 4, "never more than workers concurrent")
+
+    def test_failure_cancels_remaining_unscheduled_work(self):
+        import threading
+        from determify.concurrency import bounded_parallel_map
+        lock = threading.Lock()
+        started = []
+
+        def fn(i):
+            with lock:
+                started.append(i)
+            if i == 0:
+                raise RuntimeError("boom")
+            return i
+
+        with self.assertRaises(RuntimeError):
+            bounded_parallel_map(fn, range(20), max_workers=2)
+        # Only the initial window was ever submitted; later work never started.
+        self.assertTrue(all(s <= 1 for s in started),
+                        f"items beyond the initial window started: {started}")
+
+    def test_workers_configurable_and_bounded(self):
+        from determify.concurrency import bounded_parallel_map as real
+        captured = {}
+
+        def spy(fn, items, max_workers):
+            captured["workers"] = max_workers
+            return real(fn, items, max_workers)
+
+        def mock_eval(*a, **k):
+            return {"answers": {}}, "mockprov"
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "a.py").write_text(
+                'openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+            with patch("determify.scanner.bounded_parallel_map", spy), \
+                 patch("determify.jev_evaluator.call_decision_endpoint", mock_eval):
+                scan_targets([td], use_kev=True, workers=2, progress=False)
+        self.assertEqual(captured.get("workers"), 2)
+
+
+class TestBatchPolicy(unittest.TestCase):
+    """CLI None must mean the library DEFAULT_BATCH_BYTES, never a silent cap change."""
+
+    def _run_cli_capture(self, argv, td):
+        from determify import cli
+        captured = {}
+        def fake_scan(*args, **kwargs):
+            captured.update(kwargs)
+            return 0, [], {"skipped": 0, "invoked": False, "fallback_used": False}
+        from unittest.mock import patch as _p
+        with _p.object(cli, "scan_targets", fake_scan), \
+             _p.object(sys, "argv", ["determify", *argv, td]), \
+             _p.dict(os.environ, {}, clear=True):
+            try:
+                cli._run_cli()
+            except SystemExit as e:
+                self.fail(f"unexpected exit {e.code}")
+        return captured
+
+    def test_cli_forwards_none_by_default_and_mib_exact(self):
+        with tempfile.TemporaryDirectory() as td:
+            default_kwargs = self._run_cli_capture(["--no-progress"], td)
+            self.assertIsNone(default_kwargs["batch_bytes"],
+                              "CLI default must forward None so the library default applies")
+            mib_kwargs = self._run_cli_capture(["--no-progress", "--batch-mb", "7"], td)
+            self.assertEqual(mib_kwargs["batch_bytes"], 7 * 1_048_576,
+                             "--batch-mb must forward exact MiB multiples")
+            workers_kwargs = self._run_cli_capture(["--no-progress", "--workers", "3"], td)
+            self.assertEqual(workers_kwargs["workers"], 3)
+
+    def test_library_none_policy_is_default_batch_bytes(self):
+        from determify import scanner
+        from determify.scanner import DEFAULT_BATCH_BYTES
+        captured = {}
+        real_batches = scanner._batches
+
+        def spy(files, batch_bytes):
+            captured["bb"] = batch_bytes
+            return real_batches(files, batch_bytes)
+
+        from unittest.mock import patch as _p
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "ok.py").write_text("x = 1\n")
+            with _p.object(scanner, "_batches", spy):
+                scanner.scan_targets([td], batch_bytes=None, progress=False)
+        self.assertEqual(captured["bb"], DEFAULT_BATCH_BYTES)
+        self.assertEqual(DEFAULT_BATCH_BYTES, 50_000_000)
+
+    def test_cli_batch_mb_subprocess_forwards_and_validates(self):
+        base = [sys.executable, "-m", "determify.cli"]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parent.parent)
+        with tempfile.TemporaryDirectory() as td:
+            for i in range(2):
+                (Path(td) / f"m{i}.py").write_text("x = 1\n" * 150000)  # ~880KB each
+            res = subprocess.run(
+                base + ["--batch-mb", "1", td], env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("batches of 1 MiB", res.stderr)
+            res_bad = subprocess.run(
+                base + ["--batch-mb", "0", td], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(res_bad.returncode, 2)
+            self.assertIn("at least 1 MiB", res_bad.stderr)
+            res_workers = subprocess.run(
+                base + ["--workers", "33", td], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(res_workers.returncode, 2)
+            self.assertIn("between 1 and 32", res_workers.stderr)
+
+
+class TestWorkOrderRoundTwo(unittest.TestCase):
+    """M1 comprehension walrus owner frames, M2 structured fallback metadata,
+    N1 batch-byte honesty, L2 container mutation aliases."""
+
+    def _scan(self, content: str):
+        from determify.scanner import EXEMPTIONS
+        EXEMPTIONS.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        return [x["id"] for x in findings]
+
+    def _cli(self, args, extra_env=None):
+        cmd = [sys.executable, "-m", "determify.cli", *args]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parent.parent)
+        for k in ("OPENROUTER_API_KEY", "JEV_API_KEY", "TYPESAFE_API_KEY",
+                  "JEV_BASE_URL", "JEV_ENDPOINT", "TYPESAFE_BASE_URL",
+                  "OPENROUTER_DECISIONS_URL", "JEV_MODEL", "KEV_ENDPOINT"):
+            env.pop(k, None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+
+    # ---- M1: comprehension walrus binds (invalidates) in the enclosing owner frame ----
+
+    def test_m1_list_comp_walrus_invalidates_owner(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'data = [(question := fetch()) for x in xs]\n'
+            'client.responses.create(input=question)\n'
+        )
+        self.assertEqual(self._scan(content), ["DET-07"])
+
+    def test_m1_set_comp_walrus(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'data = {(question := fetch()) for x in xs}\n'
+            'client.responses.create(input=question)\n'
+        )
+        self.assertNotIn("DET-01", self._scan(content))
+
+    def test_m1_dict_comp_walrus(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'data = {k: (question := fetch()) for k in ks}\n'
+            'client.responses.create(input=question)\n'
+        )
+        self.assertNotIn("DET-01", self._scan(content))
+
+    def test_m1_generator_walrus_invalidated_conservatively(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'gen = ((question := fetch()) for x in xs)\n'
+            'client.responses.create(input=question)\n'
+        )
+        # Generator bodies execute lazily; the write is unknown, so stale literal
+        # must not be trusted (conservative invalidation, no DET-01).
+        self.assertNotIn("DET-01", self._scan(content))
+
+    def test_m1_nested_comp_walrus(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'data = [[(question := fetch()) for y in row] for row in matrix]\n'
+            'client.responses.create(input=question)\n'
+        )
+        self.assertNotIn("DET-01", self._scan(content))
+
+    def test_m1_lambda_in_comp_binds_lambda_frame_not_owner(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'data = [(lambda: (question := fetch()))() for x in xs]\n'
+            'client.responses.create(input=question)\n'
+        )
+        # Python: walrus inside lambda binds the lambda's own scope, so the module
+        # literal genuinely survives. Correctness preserved, not blanket-dropped.
+        self.assertIn("DET-01", self._scan(content))
+
+    def test_m1_comp_walrus_owners_inner_function_frame(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'def f():\n'
+            '    data = [(question := fetch()) for x in xs]\n'
+            '    return client.responses.create(input=question)\n'
+            'client.responses.create(input=question)\n'
+        )
+        ids = self._scan(content)
+        # f-internal call must NOT report the module literal (f-local walrus target),
+        # while the module-level call keeps the still-valid module literal.
+        self.assertIn("DET-01", ids)
+        self.assertEqual(ids.count("DET-07"), 2)
+        det01_lines = self._scan_det01_lines(content)
+        self.assertTrue(all(ln in (1, 5) for ln in det01_lines), det01_lines)
+
+    def _scan_det01_lines(self, content):
+        from determify.scanner import EXEMPTIONS
+        EXEMPTIONS.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(content)
+            f.flush()
+            findings = scan_file(f.name)
+        os.unlink(f.name)
+        return [x["line"] for x in findings if x["id"] == "DET-01"]
+
+    def test_m1_walrus_in_comp_inside_call_args(self):
+        content = (
+            'question = "What is today\'s date?"\n'
+            'client.responses.create(input=[(question := fetch()) for x in xs], prompt=question)\n'
+        )
+        # Arguments evaluate left to right: the comp rebinds question before the
+        # call runs; prompt=question must not use the stale literal.
+        self.assertNotIn("DET-01", self._scan(content))
+
+    def test_m1_regression_all_four_original_snippets(self):
+        self.assertEqual(
+            self._scan('question = "What is today\'s date?"\n'
+                       'client.responses.create(input=(question:=fetch()))\n'
+                       'client.responses.create(input=question)\n'),
+            ["DET-07", "DET-07"])
+        self.assertEqual(
+            self._scan('question = "What is today\'s date?"\n'
+                       'question, other = fetch()\n'
+                       'client.responses.create(input=question)\n'),
+            ["DET-07"])
+        self.assertEqual(
+            self._scan('if flag:\n'
+                       '    question = "What is today\'s date?"\n'
+                       'else:\n'
+                       '    client.responses.create(input=question)\n'),
+            ["DET-07"])
+        ids = self._scan('class Example:\n'
+                         '    question = "What is today\'s date?"\n'
+                         '    client.responses.create(input=question)\n')
+        self.assertEqual(sorted(ids), ["DET-01", "DET-07"])
+
+    # ---- L2: subscript mutation invalidates root and simple aliases ----
+
+    def test_l2_subscript_assign_invalidates_root_and_alias(self):
+        content = (
+            'data = {"question": "What is today\'s date?"}\n'
+            'alias = data\n'
+            'data["question"] = fetch()\n'
+            'client.responses.create(input=data)\n'
+            'client.responses.create(input=alias)\n'
+        )
+        self.assertEqual(self._scan(content), ["DET-07", "DET-07"])
+
+    def test_l2_subscript_augassign_and_delete(self):
+        content = (
+            'data = {"question": "what is today\'s date?"}\n'
+            'data["question"] += fetch()\n'
+            'client.responses.create(input=data)\n'
+        )
+        self.assertNotIn("DET-01", self._scan(content))
+        content2 = (
+            'data = {"question": "what is today\'s date?"}\n'
+            'del data["question"]\n'
+            'client.responses.create(input=data)\n'
+        )
+        self.assertNotIn("DET-01", self._scan(content2))
+
+    def test_l2_rebind_does_not_invalidate_alias(self):
+        content = (
+            'data = {"question": "what is today\'s date?"}\n'
+            'alias = data\n'
+            'data = fetch()\n'
+            'client.responses.create(input=alias)\n'
+        )
+        # Rebinding the name leaves aliased objects untouched in Python; the
+        # alias still points at the old (tracked) container content.
+        self.assertIn("DET-01", self._scan(content))
+
+    def test_l2_fstring_literal_skeleton_still_valid(self):
+        content = (
+            "today = fetch()\n"
+            'client.responses.create(input=f"what is today\'s date? {today}")\n'
+        )
+        # Dynamic holes do not void the static literal cue fragments.
+        self.assertIn("DET-01", self._scan(content))
+
+    # ---- M2: structured fallback metadata, no provider-string sniffing ----
+
+    def test_m2_healthy_model_named_fallback_is_not_a_fallback_claim(self):
+        prim, pport, preqs = _make_decision_server({"mode": "json"})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "app.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+                res = self._cli(
+                    ["--jev", "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "k", "--model", "my-fallback-model", "--no-progress", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Triage queries were evaluated by", res.stdout)
+            self.assertNotIn("Explicit fallback used", res.stdout)
+            self.assertEqual(len(kreqs), 0, "healthy primary must never touch Kev")
+            self.assertEqual(len(preqs), 1)
+            self.assertIn("my-fallback-model", res.stdout)
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+    def test_m2_missing_key_reports_not_contacted_never_transient(self):
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "app.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+                res = self._cli(
+                    ["--jev", "--allow-fallback", "--no-progress", "--json", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            data = json.loads(res.stdout)
+            verdicts = [f["jev_eval"] for f in data["findings"] if f.get("jev_eval")]
+            self.assertTrue(verdicts)
+            self.assertTrue(all(v.get("fallback_used") for v in verdicts))
+            self.assertTrue(all(v["fallback"]["reason"] == "no_cloud_key" for v in verdicts))
+            self.assertTrue(all(v["fallback"]["contacted_primary"] is False for v in verdicts))
+            self.assertEqual(len(kreqs), len(verdicts))
+        finally:
+            kev.shutdown(); kev.server_close()
+
+    def test_m2_missing_key_stdout_banner_wording(self):
+        kev, kport, _ = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "app.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+                res = self._cli(
+                    ["--jev", "--allow-fallback", "--no-progress", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("was not contacted", res.stdout)
+            self.assertNotIn("transient availability", res.stdout)
+            self.assertIn("no cloud API key configured", res.stderr)
+        finally:
+            kev.shutdown(); kev.server_close()
+
+    def test_m2_env_file_kev_destination_matches_actual_post(self):
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                env_file = Path(td) / ".env.custom"
+                kev_url = f"http://127.0.0.1:{kport}/custom-systemone-path"
+                env_file.write_text(f"KEV_ENDPOINT={kev_url}\n")
+                target = Path(td) / "app.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+                res = self._cli(
+                    ["--jev", "--allow-fallback", "--no-progress",
+                     "--env-file", str(env_file), str(target)],
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn(kev_url, res.stdout,
+                          "disclosed fallback destination must be the env-file-resolved URL")
+            self.assertEqual(len(kreqs), 1, "request actually went to the env-file destination")
+        finally:
+            kev.shutdown(); kev.server_close()
+
+    def test_m2_availability_fallback_uses_transient_wording(self):
+        prim, pport, preqs = _make_decision_server({"mode": "status", "code": 503})
+        kev, kport, kreqs = _make_decision_server({"mode": "json"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "app.py"
+                target.write_text('openai.chat.completions.create(model="gpt-4o", messages=[])\n')
+                res = self._cli(
+                    ["--jev", "--base-url", f"http://127.0.0.1:{pport}/v1/systemone",
+                     "--api-key", "k", "--allow-fallback", "--no-progress", str(target)],
+                    {"KEV_ENDPOINT": f"http://127.0.0.1:{kport}/v1/systemone"},
+                )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("transient availability error", res.stdout)
+            self.assertIn(f"http://127.0.0.1:{pport}", res.stdout)
+            self.assertIn(f"http://127.0.0.1:{kport}", res.stdout)
+            self.assertNotIn("was not contacted", res.stdout)
+            self.assertEqual(len(preqs), 1)
+            self.assertEqual(len(kreqs), 1)
+        finally:
+            prim.shutdown(); prim.server_close()
+            kev.shutdown(); kev.server_close()
+
+    # ---- N1: batch byte budget stated honestly ----
+
+    def test_n1_batch_default_documented_as_bytes_not_mib(self):
+        root = Path(__file__).parent.parent
+        src = (root / "determify" / "scanner.py").read_text()
+        self.assertIn("50_000_000", src)
+        self.assertNotIn("# 50 MiB per batch", src)
+        self.assertIn("47.7 MiB", src)
+        cli_src = (root / "determify" / "cli.py").read_text()
+        self.assertIn("50,000,000 bytes", cli_src)
+        self.assertNotIn("omitted: 50 MiB", cli_src)
+        res = subprocess.run(
+            [sys.executable, "-m", "determify.cli", "--help"],
+            env={**os.environ, "PYTHONPATH": str(root)},
+            capture_output=True, text=True, timeout=20)
+        self.assertIn("50,000,000 bytes", res.stdout)
+
+
+class TestDocumentationClaims(unittest.TestCase):
+    """Measured-claim sweep: no unsupported speed/precision assurances outside the
+    design-maxim quotes (which stay, marked with a compute-cost caveat)."""
+
+    FORBIDDEN = [
+        "sub-ms", "sub-millisecond", "sub-100ms", "sub-90ms",
+        "<5ms", "<100ms", "2ms", "95-100%",
+        "Instant execution", "instant execution",
+        "100% token elimination", "100% predictability",
+        "air-gapped on localhost", "guaranteed air gap",
+    ]
+
+    def test_no_unsupported_metric_claims(self):
+        root = Path(__file__).parent.parent
+        targets = ["README.md", "SKILL.md", "determify/patterns.py", "determify/cli.py",
+                   "determify/deep_scanner.py", "determify/jev_evaluator.py"]
+        for rel in targets:
+            text = (root / rel).read_text(encoding="utf-8")
+            for phrase in self.FORBIDDEN:
+                self.assertNotIn(phrase, text, f"{rel} still claims {phrase!r}")
+
+    def test_design_maxim_kept_with_caveat(self):
+        root = Path(__file__).parent.parent
+        for rel in ("README.md", "SKILL.md"):
+            text = (root / rel).read_text(encoding="utf-8")
+            self.assertIn("Never use an LLM if a 3-line", text)
+            self.assertIn("design maxim", text.lower())
+
+    def test_skill_frontmatter_compatibility_is_string(self):
+        root = Path(__file__).parent.parent
+        text = (root / "SKILL.md").read_text(encoding="utf-8")
+        m = re.search(r"(?m)^compatibility:\s*(.+)$", text.split("---")[1])
+        self.assertIsNotNone(m, "compatibility field present")
+        value = m.group(1).strip()
+        self.assertTrue(value.startswith('"') and value.endswith('"'),
+                        "compatibility must be a string per the metadata schema")
+        self.assertNotIn("etc.", text)
+
+    def test_exemption_binding_documented(self):
+        root = Path(__file__).parent.parent
+        text = (root / "determify" / "deep_scanner.py").read_text(encoding="utf-8")
+        self.assertIn("exact signal line", text)
 
 
 if __name__ == "__main__":

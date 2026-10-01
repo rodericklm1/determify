@@ -3,6 +3,21 @@ ast_scanner.py - Syntax-Aware Python AST Scanner for Determify.
 Performs zero-dependency syntactic inspection of Python source code to detect
 deterministic AI waste, multiline f-strings, and ungated LLM call sites with robust
 lexical scope stacks, conservative control-flow invalidation, and container alias resolution.
+
+Scope model (syntactic approximation, not a data-flow engine):
+- Walrus targets resolve to their true owner frame: comprehension scopes are
+  skipped (they are execution closures), lambda/function frames stop the search,
+  and comprehension walrus writes are applied invalidate-only, never literal-bound.
+- Subscript assignment/aug-assign/delete mutates the aliased object; the root
+  binding and any names sharing its exact binding object (simple `b = a` alias
+  identity) are invalidated. Deeper aliasing (parameter passing, nested
+  containers, returned aliases) is NOT modeled: findings are conservative
+  candidates, never a soundness or precision guarantee.
+- f-string resolution uses only the STATIC literal fragments of a skeleton:
+  a cue inside a literal fragment is legitimate candidate evidence and is not
+  masked, while arbitrary dynamic expressions, interprocedural data flow, and
+  mutations through untracked aliases are outside the model. Coverage is
+  reported as partial; findings are candidates, not proof.
 """
 
 import ast
@@ -27,6 +42,51 @@ EXPLICIT_CHAT_CLASSES = {
 }
 
 CLI_AGENT_COMMANDS = re.compile(r"\b(?:opencode\s+run|hermes\s+run|claude\s+-p|sgpt\s+-[soec])\b")
+
+# Sentinel distinguishing "name absent from frame" from "name present but invalidated"
+_MISSING = object()
+
+_COMP_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+def _collect_arg_named_exprs(node):
+    """
+    Collect (NamedExpr, nested) pairs from a call-argument subtree, where
+    nested=True when the NamedExpr sits below a lambda or comprehension boundary
+    in that subtree (it then binds in a different runtime frame than the
+    statement scope and must be treated as invalidate-only).
+    """
+    out = []
+
+    def rec(n, nested):
+        for child in ast.iter_child_nodes(n):
+            if isinstance(child, ast.NamedExpr):
+                out.append((child, nested))
+                rec(child.value, nested)
+            elif isinstance(child, (ast.Lambda,) + _COMP_NODES):
+                rec(child, True)
+            else:
+                rec(child, nested)
+
+    rec(node, False)
+    return out
+
+def _subscript_root_name(target: ast.AST):
+    """d["a"]["b"] walks down to the root Name 'd'. Non-Subscript returns None."""
+    if not isinstance(target, ast.Subscript):
+        return None
+    while isinstance(target.value, ast.Subscript):
+        target = target.value
+    return target.value if isinstance(target.value, ast.Name) else None
+
+def _pattern_capture_names(pattern: ast.AST) -> set:
+    """Collects the binding names a match-case pattern would capture (always dynamic)."""
+    names = set()
+    for sub in ast.walk(pattern):
+        if isinstance(sub, (ast.MatchAs, ast.MatchStar)) and sub.name:
+            names.add(sub.name)
+        elif isinstance(sub, ast.MatchMapping) and sub.rest:
+            names.add(sub.rest)
+    return names
 
 # Standard logging and diagnostic method names (not model inference calls)
 LOGGER_METHODS = {"info", "debug", "warning", "error", "log", "critical", "exception"}
@@ -125,10 +185,14 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.pattern_map = {p["id"]: p for p in PATTERNS}
 
     def _lookup_variable(self, name: str):
-        """Searches scope stack from innermost to outermost for variable binding, respecting class boundary isolation."""
-        for scope in reversed(self.scopes):
-            # Class scopes are isolated namespaces; methods do not resolve class-level variables as bare names in Python
-            if scope.get("__is_class__"):
+        """
+        Search the scope stack innermost-first, respecting class boundary isolation.
+        A class frame is skipped only when it encloses another frame: in Python,
+        methods and nested scopes never resolve bare names through the class
+        namespace, while statements inside the class body itself can.
+        """
+        for depth, scope in enumerate(reversed(self.scopes)):
+            if depth and scope.get("__is_class__"):
                 continue
             if name in scope:
                 return scope[name]
@@ -141,6 +205,54 @@ class DetermifyASTVisitor(ast.NodeVisitor):
     def _invalidate_variable(self, name: str):
         """Invalidates a variable in the current scope frame (e.g. upon dynamic reassignment or parameter masking)."""
         self.scopes[-1][name] = None
+
+    def _invalidate_container(self, name: str):
+        """
+        Subscript assignment/aug-assign/delete mutates the aliased object itself.
+        Conservatively invalidate every frame binding of the root name and every
+        name sharing its exact binding object (simple same-object alias tracking).
+        Limitation: only direct `b = a` literal alias identity is modeled; rebinding,
+        nested containers, and function-parameter aliasing are not tracked.
+        """
+        objects = []
+        for scope in self.scopes:
+            val = scope.get(name)
+            if isinstance(val, tuple):
+                objects.append(val)
+                scope[name] = None
+        if objects:
+            for scope in self.scopes:
+                for key, val in list(scope.items()):
+                    if any(val is obj for obj in objects):
+                        scope[key] = None
+
+    def _apply_named_expr(self, node, invalidate_only: bool = False):
+        """
+        Applies a walrus (:=) binding in its true owner frame: comprehension
+        frames are execution scopes, not binding scopes, so the search skips
+        them and stops at the nearest regular function/lambda/module frame
+        (a class-frame owner is a SyntaxError in valid Python, so no cross-class
+        leak is possible). Inside a comprehension the write is dynamic by
+        construction and is applied invalidate-only, so no stale literal can
+        leak into later calls.
+        """
+        if not isinstance(node.target, ast.Name):
+            return
+        name = node.target.id
+        idx = len(self.scopes) - 1
+        skipped_comp = False
+        while idx > 0 and self.scopes[idx].get("__is_comp__"):
+            idx -= 1
+            skipped_comp = True
+        frame = self.scopes[idx]
+        if invalidate_only or skipped_comp:
+            frame[name] = None
+            return
+        text, _ = _extract_string_content(node.value, scope_lookup=self._lookup_variable)
+        if text:
+            frame[name] = (text, getattr(node, "lineno", 0))
+        else:
+            frame[name] = None
 
     def _add_finding(self, rule_id: str, line_no: int, snippet: str, call_start_line: int = None):
         # Check suppression on the specific line, or on the parent call statement line if multiline
@@ -173,6 +285,23 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         val_snippet = self.lines[line_no - 1].strip() if line_no <= len(self.lines) else ""
 
         for target in target_nodes:
+            # Tuple/list destructuring (a, b = ...): positional literal tracking is
+            # out of scope, so conservatively invalidate every plain name in the target.
+            if isinstance(target, (ast.Tuple, ast.List)):
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Subscript):
+                        root = _subscript_root_name(sub)
+                        if root is not None:
+                            self._invalidate_container(root.id)
+                    elif isinstance(sub, ast.Name):
+                        self._invalidate_variable(sub.id)
+                continue
+            # Subscript target (data["k"] = ...): mutates the aliased container object,
+            # not the root binding itself, but the tracked text is now stale.
+            root = _subscript_root_name(target)
+            if root is not None:
+                self._invalidate_container(root.id)
+                continue
             # Only track bare local/module names; ignore attribute targets (e.g. obj.question = ...)
             if not isinstance(target, ast.Name):
                 continue
@@ -215,6 +344,34 @@ class DetermifyASTVisitor(ast.NodeVisitor):
                 if cue_re.search(text):
                     self._add_finding(rule_id, line_no, val_snippet)
 
+    def _invalidate_target_names(self, target_node: ast.AST):
+        for sub in ast.walk(target_node):
+            if isinstance(sub, ast.Name):
+                self._invalidate_variable(sub.id)
+
+    def _isolate_sections(self, sections):
+        """
+        Visit each statement section starting from the scope state captured
+        before the compound statement, so branches never share mutated state.
+        Afterwards, conservatively merge: every binding touched by any section
+        is invalidated, because at runtime any subset of the sections may have
+        executed. This is a syntactic approximation, not a data-flow engine.
+        """
+        entry = dict(self.scopes[-1])
+        touched = set()
+        for section in sections:
+            self.scopes[-1].clear()
+            self.scopes[-1].update(entry)
+            for stmt in section:
+                self.visit(stmt)
+            for name, val in self.scopes[-1].items():
+                if entry.get(name, _MISSING) != val:
+                    touched.add(name)
+        for name in touched:
+            entry[name] = None
+        self.scopes[-1].clear()
+        self.scopes[-1].update(entry)
+
     def visit_Assign(self, node: ast.Assign):
         line_no = getattr(node, "lineno", 1)
         self._record_assignment(node.targets, node.value, line_no)
@@ -229,83 +386,127 @@ class DetermifyASTVisitor(ast.NodeVisitor):
                 self._invalidate_variable(node.target.id)
         self.generic_visit(node)
 
+    def visit_NamedExpr(self, node):
+        # Standalone or in-test walrus: bind literal or invalidate before anything
+        # downstream reads the name.
+        self._apply_named_expr(node)
+        self.generic_visit(node)
+
     def visit_AugAssign(self, node: ast.AugAssign):
-        # Augmented assignment (e.g. prompt += x) makes variable dynamic; invalidate
+        # Augmented assignment (e.g. prompt += x) makes variable dynamic; invalidate.
+        # A subscript target (d["k"] += x) mutates the container object instead.
         if isinstance(node.target, ast.Name):
             self._invalidate_variable(node.target.id)
+        else:
+            root = _subscript_root_name(node.target)
+            if root is not None:
+                self._invalidate_container(root.id)
         self.generic_visit(node)
 
     def visit_Delete(self, node: ast.Delete):
-        # Explicit deletion (del question) invalidates variable
+        # Explicit deletion (del question) invalidates the name; del d["k"] mutates
+        # the aliased container object, so invalidate the root and its aliases.
         for target in node.targets:
             if isinstance(target, ast.Name):
                 self._invalidate_variable(target.id)
+            else:
+                root = _subscript_root_name(target)
+                if root is not None:
+                    self._invalidate_container(root.id)
+        self.generic_visit(node)
+
+    def visit_Global(self, node):
+        # A global declaration redirects writes to the module frame; conservatively
+        # invalidate the names there so no function-body literal leaks outward.
+        for name in node.names:
+            self.scopes[0][name] = None
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node):
+        for name in node.names:
+            for scope in self.scopes[:-1]:
+                if not scope.get("__is_class__"):
+                    scope[name] = None
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For):
-        # Loop iteration targets are dynamic; invalidate
-        for sub in ast.walk(node.target):
-            if isinstance(sub, ast.Name):
-                self._invalidate_variable(sub.id)
-        self.generic_visit(node)
-        for sub in ast.walk(node.target):
-            if isinstance(sub, ast.Name):
-                self._invalidate_variable(sub.id)
+        # Loop iteration targets are dynamic; the body may also never execute,
+        # so names written inside it are invalidated on merge.
+        self.visit(node.iter)
+        self._invalidate_target_names(node.target)
+        self._isolate_sections([node.body, node.orelse])
 
     def visit_AsyncFor(self, node: ast.AsyncFor):
-        for sub in ast.walk(node.target):
-            if isinstance(sub, ast.Name):
-                self._invalidate_variable(sub.id)
-        self.generic_visit(node)
-        for sub in ast.walk(node.target):
-            if isinstance(sub, ast.Name):
-                self._invalidate_variable(sub.id)
+        self.visit(node.iter)
+        self._invalidate_target_names(node.target)
+        self._isolate_sections([node.body, node.orelse])
+
+    def visit_While(self, node):
+        # Zero-or-many iterations: identical treatment to For on the body.
+        self.visit(node.test)
+        self._isolate_sections([node.body, node.orelse])
 
     def visit_With(self, node: ast.With):
         for item in node.items:
+            self.visit(item.context_expr)
             if item.optional_vars:
-                for sub in ast.walk(item.optional_vars):
-                    if isinstance(sub, ast.Name):
-                        self._invalidate_variable(sub.id)
-        self.generic_visit(node)
+                self._invalidate_target_names(item.optional_vars)
+        # Body may exit via exception mid-way; written names are not guaranteed.
+        self._isolate_sections([node.body])
 
     def visit_AsyncWith(self, node: ast.AsyncWith):
         for item in node.items:
+            self.visit(item.context_expr)
             if item.optional_vars:
-                for sub in ast.walk(item.optional_vars):
-                    if isinstance(sub, ast.Name):
-                        self._invalidate_variable(sub.id)
-        self.generic_visit(node)
+                self._invalidate_target_names(item.optional_vars)
+        self._isolate_sections([node.body])
+
+    def visit_Try(self, node):
+        self._isolate_try_sections(node)
+
+    def visit_TryStar(self, node):
+        self._isolate_try_sections(node)
+
+    def _isolate_try_sections(self, node):
+        # Each handler sees only the state at the raise point (unknown), and the
+        # body may abort anywhere: isolate every section from the pre-try state.
+        sections = [node.body] + [[h] for h in node.handlers] + [node.orelse, node.finalbody]
+        self._isolate_sections(sections)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         if node.name:
             self._invalidate_variable(node.name)
         self.generic_visit(node)
 
+    def visit_Match(self, node):
+        # Case patterns capture dynamic subject fragments and guards/body execute
+        # on at most one path: isolate each case like an if/elif chain.
+        self.visit(node.subject)
+        entry = dict(self.scopes[-1])
+        touched = set()
+        for case in node.cases:
+            self.scopes[-1].clear()
+            self.scopes[-1].update(entry)
+            for captured in _pattern_capture_names(case.pattern):
+                self._invalidate_variable(captured)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for stmt in case.body:
+                self.visit(stmt)
+            for name, val in self.scopes[-1].items():
+                if entry.get(name, _MISSING) != val:
+                    touched.add(name)
+        for name in touched:
+            entry[name] = None
+        self.scopes[-1].clear()
+        self.scopes[-1].update(entry)
+
     def visit_If(self, node: ast.If):
-        # Statically uncertain control flow: variables assigned conditionally are invalidated after the block
-        cond_assigned = set()
-        for stmt in node.body + node.orelse:
-            for sub in ast.walk(stmt):
-                if isinstance(sub, ast.Assign):
-                    for t in sub.targets:
-                        if isinstance(t, ast.Name):
-                            cond_assigned.add(t.id)
-                elif isinstance(sub, ast.AnnAssign):
-                    if isinstance(sub.target, ast.Name):
-                        cond_assigned.add(sub.target.id)
-                elif isinstance(sub, ast.NamedExpr):
-                    if isinstance(sub.target, ast.Name):
-                        cond_assigned.add(sub.target.id)
-
+        # Statically uncertain control flow: the test (which may walrus-bind) runs
+        # first, then each branch is evaluated from the pre-branch state and merged
+        # conservatively so no binding leaks across branches or past the block.
         self.visit(node.test)
-        for stmt in node.body:
-            self.visit(stmt)
-        for stmt in node.orelse:
-            self.visit(stmt)
-
-        for var_name in cond_assigned:
-            self._invalidate_variable(var_name)
+        self._isolate_sections([node.body, node.orelse])
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         # Push new local function scope
@@ -321,6 +522,9 @@ class DetermifyASTVisitor(ast.NodeVisitor):
 
         self.generic_visit(node)
         self.scopes.pop()
+        # Executing the def statement rebinds the function name itself (e.g.
+        # `question = "literal"; def question(): ...` masks the old binding).
+        self._invalidate_variable(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         self.scopes.append({})
@@ -334,6 +538,7 @@ class DetermifyASTVisitor(ast.NodeVisitor):
 
         self.generic_visit(node)
         self.scopes.pop()
+        self._invalidate_variable(node.name)
 
     def visit_Lambda(self, node: ast.Lambda):
         self.scopes.append({})
@@ -353,9 +558,12 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.scopes.append({"__is_class__": True})
         self.generic_visit(node)
         self.scopes.pop()
+        self._invalidate_variable(node.name)
 
-    def visit_ListComp(self, node: ast.ListComp):
-        self.scopes.append({})
+    def visit_ListComp(self, node):
+        # Comprehensions execute in their own scope (they can read outer names but
+        # walrus writes skip this frame; see _apply_named_expr).
+        self.scopes.append({"__is_comp__": True})
         for gen in node.generators:
             for sub in ast.walk(gen.target):
                 if isinstance(sub, ast.Name):
@@ -363,8 +571,10 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self.scopes.pop()
 
-    def visit_SetComp(self, node: ast.SetComp):
-        self.scopes.append({})
+    def visit_SetComp(self, node):
+        # Comprehensions execute in their own scope (they can read outer names but
+        # walrus writes skip this frame; see _apply_named_expr).
+        self.scopes.append({"__is_comp__": True})
         for gen in node.generators:
             for sub in ast.walk(gen.target):
                 if isinstance(sub, ast.Name):
@@ -372,8 +582,10 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self.scopes.pop()
 
-    def visit_DictComp(self, node: ast.DictComp):
-        self.scopes.append({})
+    def visit_DictComp(self, node):
+        # Comprehensions execute in their own scope (they can read outer names but
+        # walrus writes skip this frame; see _apply_named_expr).
+        self.scopes.append({"__is_comp__": True})
         for gen in node.generators:
             for sub in ast.walk(gen.target):
                 if isinstance(sub, ast.Name):
@@ -381,20 +593,40 @@ class DetermifyASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self.scopes.pop()
 
-    def visit_GeneratorExp(self, node: ast.GeneratorExp):
-        self.scopes.append({})
+    def visit_GeneratorExp(self, node):
+        # Comprehensions execute in their own scope (they can read outer names but
+        # walrus writes skip this frame; see _apply_named_expr).
+        self.scopes.append({"__is_comp__": True})
         for gen in node.generators:
             for sub in ast.walk(gen.target):
                 if isinstance(sub, ast.Name):
                     self._invalidate_variable(sub.id)
         self.generic_visit(node)
         self.scopes.pop()
+
+    def visit_Import(self, node: ast.Import):
+        # Binding names via import are module objects, never tracked prompt literals.
+        for a in node.names:
+            self._invalidate_variable((a.asname or a.name).split(".")[0])
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        for a in node.names:
+            self._invalidate_variable(a.asname or a.name)
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call):
         call_name = _get_call_name(node)
         func_attr = _get_call_func_attr(node)
         line_no = getattr(node, "lineno", 1)
         raw_line = self.lines[line_no - 1].strip() if line_no <= len(self.lines) else ""
+
+        # Python evaluates walrus rebinds while building the argument list, before
+        # the call executes. Apply every NamedExpr target in this call's arguments
+        # first so scope resolution never uses a stale literal the argument replaces.
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            for ne, nested in _collect_arg_named_exprs(arg):
+                self._apply_named_expr(ne, invalidate_only=nested)
 
         # DET-07: Subprocess calls running agent CLIs (e.g. subprocess.run(["opencode", "run", ...]))
         if call_name in {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "os.system"}:
